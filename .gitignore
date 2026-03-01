@@ -1,0 +1,21 @@
+# Images
+*.png
+*.jpg
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+
+# Output files
+zstack_out/
+*.tif
+*.tiff
+*.npy
+*.npz
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
