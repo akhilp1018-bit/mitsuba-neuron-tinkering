@@ -1,9 +1,3 @@
-# make_zstack_realpsf_roi_EMonly_thickshell_imagejstack.py
-# Updated according to Andreas' feedback + fixes Fiji Z/T issue:
-# 1) Use PSF_em only (baseline)
-# 2) Mesh is NOT watertight -> thick-shell emitters (surface sample + push inward + jitter)
-# 3) ROI in XY, full depth in Z
-# 4) Save as a proper ImageJ Z-stack in ONE write call so Fiji reads Z correctly (Z=NUM_SLICES, T=1)
 
 import os
 import numpy as np
@@ -18,15 +12,14 @@ mi.set_variant("scalar_rgb")
 # -----------------------------
 MESH_PATH = "../neuron/mesh_centered.ply"
 OUT_DIR = "zstack_out"
-PSF_EM_TIF = r"C:\mitsuba_work\scripts\psf_confocal_488nm_NA1_64x64x13.tif"
-
+PSF_EM_TIF = r"C:\Users\91813\Documents\github\mitsuba-neuron-tinkering\scripts\psf_bornwolf_widefield_488nm_NA1_64x64x13.tif"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # -----------------------------
-# Physical sampling (REAL)
+# Physical sampling
 # -----------------------------
-XY_UM_PER_PX = 0.2   # µm/px
-Z_STEP_UM = 0.5      # µm/slice
+XY_UM_PER_PX = 0.2   # 200 nm/px
+Z_STEP_UM = 0.5      # 500 nm/slice
 Z_STEP_NM = Z_STEP_UM * 1000.0
 
 # -----------------------------
@@ -39,19 +32,29 @@ ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
 # -----------------------------
-# Thick-shell fluorophore settings (mesh is not watertight)
+# Thick-shell emitters
 # -----------------------------
-NUM_EMITTERS = 2_000_000   # try 2_000_000 if still speckly
-THICKNESS_UM = 2.0         # try 3–5 µm if needed
-JITTER_UM = 0.3            # try 0.5 µm if needed
-
+NUM_EMITTERS = 1_000_000
+THICKNESS_UM = 2.0
+JITTER_UM = 0.3
 RNG_SEED = 0
+
+# -----------------------------
+# PSF selection + optics (match Fiji)
+# -----------------------------
+USE_GAUSSIAN_PSF = False   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
+
+LAMBDA_NM = 488.0
+NA = 1.0
+REF_INDEX = 1.0           # you said 1.0 (note: water is ~1.33)
+GAUSS_PSF_SHAPE_ZYX = (13, 64, 64)  # match Fiji stack size
 
 print("=== SETTINGS ===")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
 print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER_MODE}, margin={MARGIN}")
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
-print(f"PSF_EM_TIF={PSF_EM_TIF}")
+print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
+print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print("===============")
 
 # -----------------------------
@@ -83,10 +86,57 @@ def save_psf_and_mips(psf: np.ndarray, prefix: str):
         os.path.join(OUT_DIR, f"{prefix}_mip_xz.tif"),
         (psf_xz / (psf_xz.max() + 1e-12) * 65535).astype(np.uint16),
     )
-    print(f"Saved {prefix}: {psf_out}")
+    print(f"Saved PSF + MIPs: {prefix}")
+
+def fwhm_to_sigma(fwhm: float) -> float:
+    return fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+
+def make_gaussian_psf_matched_zyx(
+    shape_zyx=(13, 64, 64),
+    lambda_nm=488.0,
+    na=1.0,
+    n=1.0,
+    xy_um_per_px=0.2,
+    z_step_um=0.5,
+) -> np.ndarray:
+    """
+    Make a 3D Gaussian PSF in (Z,Y,X) with sigma chosen from diffraction-limited
+    FWHM approximations (widefield-like):
+        FWHM_xy ≈ 0.61 * lambda / NA
+        FWHM_z  ≈ 2 * n * lambda / NA^2
+    """
+    lam_um = lambda_nm * 1e-3  # nm -> µm
+
+    fwhm_xy_um = 0.61 * lam_um / na
+    fwhm_z_um = (2.0 * n * lam_um) / (na ** 2)
+
+    sigma_xy_um = fwhm_to_sigma(fwhm_xy_um)
+    sigma_z_um = fwhm_to_sigma(fwhm_z_um)
+
+    sigma_x_px = sigma_xy_um / xy_um_per_px
+    sigma_y_px = sigma_xy_um / xy_um_per_px
+    sigma_z_px = sigma_z_um / z_step_um
+
+    print("Gaussian PSF matched (approx):")
+    print(f"  FWHM_xy ≈ {fwhm_xy_um:.3f} µm -> sigma_xy ≈ {sigma_xy_um:.3f} µm -> {sigma_x_px:.2f} px")
+    print(f"  FWHM_z  ≈ {fwhm_z_um:.3f} µm -> sigma_z  ≈ {sigma_z_um:.3f} µm -> {sigma_z_px:.2f} px")
+
+    pz, py, px = shape_zyx
+    z = np.arange(pz) - (pz // 2)
+    y = np.arange(py) - (py // 2)
+    x = np.arange(px) - (px // 2)
+    zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+
+    psf = np.exp(
+        -(zz**2 / (2.0 * sigma_z_px**2) +
+          yy**2 / (2.0 * sigma_y_px**2) +
+          xx**2 / (2.0 * sigma_x_px**2))
+    ).astype(np.float32)
+    psf /= (psf.max() + 1e-12)
+    return psf
 
 # -----------------------------
-# 1) Load mesh bbox with Mitsuba (units: nm)
+# 1) Load mesh bbox with Mitsuba (nm)
 # -----------------------------
 mesh = mi.load_dict({"type": "ply", "filename": MESH_PATH})
 bbox = mesh.bbox()
@@ -94,7 +144,7 @@ xmin0, ymin0, zmin = float(bbox.min[0]), float(bbox.min[1]), float(bbox.min[2])
 xmax0, ymax0, zmax = float(bbox.max[0]), float(bbox.max[1]), float(bbox.max[2])
 print(f"Mesh bbox (nm): x[{xmin0:.1f},{xmax0:.1f}] y[{ymin0:.1f},{ymax0:.1f}] z[{zmin:.1f},{zmax:.1f}]")
 
-# Expand bbox slightly for ROI centering
+# Expand bbox for ROI centering
 xrange = xmax0 - xmin0
 yrange = ymax0 - ymin0
 xmin_m = xmin0 - MARGIN * xrange
@@ -124,15 +174,11 @@ xspan_um = (xmax - xmin) / 1000.0
 yspan_um = (ymax - ymin) / 1000.0
 W = int(np.ceil(xspan_um / XY_UM_PER_PX)) + 1
 H = int(np.ceil(yspan_um / XY_UM_PER_PX)) + 1
-actual_x = xspan_um / (W - 1)
-actual_y = yspan_um / (H - 1)
-
 print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
-print(f"Actual pixel size: {actual_x:.4f} µm/px × {actual_y:.4f} µm/px (target {XY_UM_PER_PX} µm/px)")
 
 # -----------------------------
-# 2) Generate thick-shell emitters using Trimesh
+# 2) Thick-shell emitters (Trimesh)
 # -----------------------------
 tm = trimesh.load(MESH_PATH, force="mesh", process=False)
 rng = np.random.default_rng(RNG_SEED)
@@ -151,7 +197,7 @@ points = pts_in
 print(f"Generated {points.shape[0]:,} thick-shell emitters")
 
 # -----------------------------
-# 3) Map emitters to pixels + filter to ROI
+# 3) Map emitters to pixels + filter ROI
 # -----------------------------
 x = points[:, 0]
 y = points[:, 1]
@@ -168,22 +214,33 @@ z = z[inside]
 print(f"Emitters inside ROI/FOV: {len(u):,}")
 
 # -----------------------------
-# 4) Load PSF_em only (baseline) + save PSF for inspection
+# 4) PSF selection
 # -----------------------------
-psf_eff = load_psf_zyx(PSF_EM_TIF)
-psf_eff /= (psf_eff.max() + 1e-12)
+if USE_GAUSSIAN_PSF:
+    psf_eff = make_gaussian_psf_matched_zyx(
+        shape_zyx=GAUSS_PSF_SHAPE_ZYX,
+        lambda_nm=LAMBDA_NM,
+        na=NA,
+        n=REF_INDEX,
+        xy_um_per_px=XY_UM_PER_PX,
+        z_step_um=Z_STEP_UM,
+    )
+    save_psf_and_mips(psf_eff, "psf_gaussian_matched")
+    psf_tag = "gaussian_matched"
+else:
+    psf_eff = load_psf_zyx(PSF_EM_TIF)
+    save_psf_and_mips(psf_eff, "psf_bornwolf_fiji")
+    psf_tag = "bornwolf_fiji"
 
 pz, py, px = psf_eff.shape
 cz, cy, cx = pz // 2, py // 2, px // 2
-print("Loaded PSF_em:", psf_eff.shape, "center:", (cz, cy, cx))
-save_psf_and_mips(psf_eff, "psf_em_only")
 
 # -----------------------------
 # 5) Full-depth Z stack
 # -----------------------------
-depth_nm = float(zmax - zmin)
-NUM_SLICES = int(np.ceil(depth_nm / Z_STEP_NM)) + 1
-print(f"Neuron depth: {depth_nm/1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES} at {Z_STEP_UM} µm step")
+depth_nm_total = float(zmax - zmin)
+NUM_SLICES = int(np.ceil(depth_nm_total / Z_STEP_NM)) + 1
+print(f"Neuron depth: {depth_nm_total/1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}")
 
 # -----------------------------
 # 6) Splat into volume (Z,Y,X)
@@ -192,11 +249,9 @@ vol = np.zeros((NUM_SLICES, H, W), dtype=np.float16)
 
 k = np.round((z - zmin) / Z_STEP_NM).astype(np.int32)
 valid = (k >= 0) & (k < NUM_SLICES)
-
 u_i = np.round(u[valid]).astype(np.int32)
 v_i = np.round(v[valid]).astype(np.int32)
 k_i = k[valid]
-
 print(f"Emitters used after Z indexing: {len(k_i):,}")
 
 for x0, y0, z0 in zip(u_i, v_i, k_i):
@@ -218,55 +273,36 @@ for x0, y0, z0 in zip(u_i, v_i, k_i):
     vol[vz0:vz1, vy0:vy1, vx0:vx1] += psf_eff[pz0:pz1, py0:py1, px0:px1].astype(np.float16)
 
 # -----------------------------
-# 7) Save as ImageJ Z-stack (single write so Fiji reads Z correctly)
+# 7) Save ImageJ Z-stack
 # -----------------------------
-tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_imagej"
+tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}"
 tiff_path = os.path.join(OUT_DIR, f"zstack_{tag}.tif")
 mip_path = os.path.join(OUT_DIR, f"mip_{tag}.tif")
 meta_txt = os.path.join(OUT_DIR, f"metadata_{tag}.txt")
 
-# Normalize for visualization
 vol_f = vol.astype(np.float32)
 vol_f /= (vol_f.max() + 1e-12)
 stack_u16 = (np.clip(vol_f, 0, 1) * 65535).astype(np.uint16)
 
 tifffile.imwrite(
     tiff_path,
-    stack_u16,  # (Z,Y,X)
+    stack_u16,
     imagej=True,
-    resolution=(1.0 / XY_UM_PER_PX, 1.0 / XY_UM_PER_PX),  # px per µm
-    metadata={
-        "axes": "ZYX",
-        "spacing": Z_STEP_UM,
-        "unit": "um",
-    },
+    resolution=(1.0 / XY_UM_PER_PX, 1.0 / XY_UM_PER_PX),
+    metadata={"axes": "ZYX", "spacing": Z_STEP_UM, "unit": "um"},
 )
-print("Saved TIFF stack (ImageJ Z-stack):", tiff_path, "shape:", stack_u16.shape)
+print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 
-# MIP for quick check
 mip = vol_f.max(axis=0)
-mip_u16 = (np.clip(mip, 0, 1) * 65535).astype(np.uint16)
-tifffile.imwrite(mip_path, mip_u16)
+tifffile.imwrite(mip_path, (np.clip(mip, 0, 1) * 65535).astype(np.uint16))
 print("Saved MIP:", mip_path)
 
-# Sidecar metadata
 with open(meta_txt, "w") as f:
     f.write("=== Render metadata ===\n")
-    f.write("MODE=PSF_em_only (baseline)\n")
-    f.write("EMITTERS=thick_shell_surface_sampled\n")
-    f.write(f"XY_UM_PER_PX={XY_UM_PER_PX}\n")
-    f.write(f"Z_STEP_UM={Z_STEP_UM}\n")
-    f.write("AXES=ZYX\n")
+    f.write(f"PSF_MODE={psf_tag}\n")
+    f.write(f"lambda_nm={LAMBDA_NM}\nNA={NA}\nrefractive_index={REF_INDEX}\n")
+    f.write(f"XY_UM_PER_PX={XY_UM_PER_PX}\nZ_STEP_UM={Z_STEP_UM}\n")
+    f.write(f"NUM_EMITTERS={NUM_EMITTERS}\nTHICKNESS_UM={THICKNESS_UM}\nJITTER_UM={JITTER_UM}\n")
     f.write(f"W={W}\nH={H}\nNUM_SLICES={NUM_SLICES}\n")
-    f.write(f"FOV_um_x={xspan_um}\nFOV_um_y={yspan_um}\n")
-    f.write(f"Neuron_depth_um={depth_nm/1000.0}\n")
-    f.write(f"ROI_used={USE_ROI}\n")
-    f.write(f"ROI_size_um_x={ROI_SIZE_UM_X}\n")
-    f.write(f"ROI_size_um_y={ROI_SIZE_UM_Y}\n")
-    f.write(f"THICKNESS_UM={THICKNESS_UM}\n")
-    f.write(f"JITTER_UM={JITTER_UM}\n")
-    f.write(f"NUM_EMITTERS={NUM_EMITTERS}\n")
-    f.write(f"PSF_shape_ZYX={psf_eff.shape}\n")
-print("Saved sidecar metadata:", meta_txt)
-
+print("Saved metadata:", meta_txt)
 print("Done.")
