@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import mitsuba as mi
@@ -8,6 +7,8 @@ import trimesh
 from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
 from src.splat import splat_emitters_with_psf_zyx
+from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
+
 mi.set_variant("scalar_rgb")
 
 # -----------------------------
@@ -49,8 +50,8 @@ USE_GAUSSIAN_PSF = False   # True: Gaussian in Python, False: Born&Wolf TIFF fro
 
 LAMBDA_NM = 488.0
 NA = 1.0
-REF_INDEX = 1.0           # you said 1.0 (note: water is ~1.33)
-GAUSS_PSF_SHAPE_ZYX = (13, 64, 64)  # match Fiji stack size
+REF_INDEX = 1.0
+GAUSS_PSF_SHAPE_ZYX = (13, 64, 64)
 
 print("=== SETTINGS ===")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
@@ -61,12 +62,10 @@ print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print("===============")
 
 # -----------------------------
-# Helpers
+# Optional helper: save PSF stack + MIPs for inspection in Fiji
+# (Safe to delete later if you don't need it)
 # -----------------------------
-
-
 def save_psf_and_mips(psf: np.ndarray, prefix: str):
-    """Save PSF stack + XY and XZ MIPs for Fiji inspection."""
     pz, py, px = psf.shape
     psf_out = os.path.join(OUT_DIR, f"{prefix}_{pz}x{py}x{px}.tif")
     tifffile.imwrite(psf_out, (np.clip(psf, 0, 1) * 65535).astype(np.uint16))
@@ -93,12 +92,12 @@ xmax0, ymax0, zmax = float(bbox.max[0]), float(bbox.max[1]), float(bbox.max[2])
 print(f"Mesh bbox (nm): x[{xmin0:.1f},{xmax0:.1f}] y[{ymin0:.1f},{ymax0:.1f}] z[{zmin:.1f},{zmax:.1f}]")
 
 # Expand bbox for ROI centering
-xrange = xmax0 - xmin0
-yrange = ymax0 - ymin0
-xmin_m = xmin0 - MARGIN * xrange
-xmax_m = xmax0 + MARGIN * xrange
-ymin_m = ymin0 - MARGIN * yrange
-ymax_m = ymax0 + MARGIN * yrange
+xrange_nm = xmax0 - xmin0
+yrange_nm = ymax0 - ymin0
+xmin_m = xmin0 - MARGIN * xrange_nm
+xmax_m = xmax0 + MARGIN * xrange_nm
+ymin_m = ymin0 - MARGIN * yrange_nm
+ymax_m = ymax0 + MARGIN * yrange_nm
 
 # Define ROI bbox
 if USE_ROI:
@@ -126,7 +125,7 @@ print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
 
 # -----------------------------
-# 2) Thick-shell emitters (Trimesh)
+# 2) Thick-shell emitters (from src/sampling.py)
 # -----------------------------
 points = sample_thickshell_emitters_nm(
     mesh_path=MESH_PATH,
@@ -135,7 +134,6 @@ points = sample_thickshell_emitters_nm(
     jitter_um=JITTER_UM,
     rng_seed=RNG_SEED,
 )
-
 print(f"Generated {points.shape[0]:,} thick-shell emitters")
 
 # -----------------------------
@@ -174,9 +172,6 @@ else:
     save_psf_and_mips(psf_eff, "psf_bornwolf_fiji")
     psf_tag = "bornwolf_fiji"
 
-pz, py, px = psf_eff.shape
-cz, cy, cx = pz // 2, py // 2, px // 2
-
 # -----------------------------
 # 5) Full-depth Z stack
 # -----------------------------
@@ -198,37 +193,40 @@ vol = splat_emitters_with_psf_zyx(
     z_step_nm=Z_STEP_NM,
     psf_zyx=psf_eff,
 )
+
 # -----------------------------
-# 7) Save ImageJ Z-stack
+# 7) Normalize + Save Z-stack + metadata
 # -----------------------------
 tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}"
-tiff_path = os.path.join(OUT_DIR, f"zstack_{tag}.tif")
-mip_path = os.path.join(OUT_DIR, f"mip_{tag}.tif")
-meta_txt = os.path.join(OUT_DIR, f"metadata_{tag}.txt")
 
 vol_f = vol.astype(np.float32)
 vol_f /= (vol_f.max() + 1e-12)
 stack_u16 = (np.clip(vol_f, 0, 1) * 65535).astype(np.uint16)
 
-tifffile.imwrite(
-    tiff_path,
-    stack_u16,
-    imagej=True,
-    resolution=(1.0 / XY_UM_PER_PX, 1.0 / XY_UM_PER_PX),
-    metadata={"axes": "ZYX", "spacing": Z_STEP_UM, "unit": "um"},
+tiff_path = save_stack_imagej_zyx_u16(
+    out_dir=OUT_DIR,
+    tag=tag,
+    stack_u16_zyx=stack_u16,
+    xy_um_per_px=XY_UM_PER_PX,
+    z_step_um=Z_STEP_UM,
 )
 print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 
-mip = vol_f.max(axis=0)
-tifffile.imwrite(mip_path, (np.clip(mip, 0, 1) * 65535).astype(np.uint16))
-print("Saved MIP:", mip_path)
-
-with open(meta_txt, "w") as f:
-    f.write("=== Render metadata ===\n")
-    f.write(f"PSF_MODE={psf_tag}\n")
-    f.write(f"lambda_nm={LAMBDA_NM}\nNA={NA}\nrefractive_index={REF_INDEX}\n")
-    f.write(f"XY_UM_PER_PX={XY_UM_PER_PX}\nZ_STEP_UM={Z_STEP_UM}\n")
-    f.write(f"NUM_EMITTERS={NUM_EMITTERS}\nTHICKNESS_UM={THICKNESS_UM}\nJITTER_UM={JITTER_UM}\n")
-    f.write(f"W={W}\nH={H}\nNUM_SLICES={NUM_SLICES}\n")
+meta_lines = [
+    "=== Render metadata ===",
+    f"PSF_MODE={psf_tag}",
+    f"lambda_nm={LAMBDA_NM}",
+    f"NA={NA}",
+    f"refractive_index={REF_INDEX}",
+    f"XY_UM_PER_PX={XY_UM_PER_PX}",
+    f"Z_STEP_UM={Z_STEP_UM}",
+    f"NUM_EMITTERS={NUM_EMITTERS}",
+    f"THICKNESS_UM={THICKNESS_UM}",
+    f"JITTER_UM={JITTER_UM}",
+    f"W={W}",
+    f"H={H}",
+    f"NUM_SLICES={NUM_SLICES}",
+]
+meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
 print("Saved metadata:", meta_txt)
 print("Done.")
