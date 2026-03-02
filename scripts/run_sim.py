@@ -1,8 +1,6 @@
 import os
 import numpy as np
 import mitsuba as mi
-import tifffile
-import trimesh
 
 from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
@@ -62,27 +60,6 @@ print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print("===============")
 
 # -----------------------------
-# Optional helper: save PSF stack + MIPs for inspection in Fiji
-# (Safe to delete later if you don't need it)
-# -----------------------------
-def save_psf_and_mips(psf: np.ndarray, prefix: str):
-    pz, py, px = psf.shape
-    psf_out = os.path.join(OUT_DIR, f"{prefix}_{pz}x{py}x{px}.tif")
-    tifffile.imwrite(psf_out, (np.clip(psf, 0, 1) * 65535).astype(np.uint16))
-
-    psf_xy = psf.max(axis=0)  # (Y,X)
-    psf_xz = psf.max(axis=1)  # (Z,X)
-    tifffile.imwrite(
-        os.path.join(OUT_DIR, f"{prefix}_mip_xy.tif"),
-        (psf_xy / (psf_xy.max() + 1e-12) * 65535).astype(np.uint16),
-    )
-    tifffile.imwrite(
-        os.path.join(OUT_DIR, f"{prefix}_mip_xz.tif"),
-        (psf_xz / (psf_xz.max() + 1e-12) * 65535).astype(np.uint16),
-    )
-    print(f"Saved PSF + MIPs: {prefix}")
-
-# -----------------------------
 # 1) Load mesh bbox with Mitsuba (nm)
 # -----------------------------
 mesh = mi.load_dict({"type": "ply", "filename": MESH_PATH})
@@ -125,7 +102,7 @@ print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
 
 # -----------------------------
-# 2) Thick-shell emitters (from src/sampling.py)
+# 2) Thick-shell emitters
 # -----------------------------
 points = sample_thickshell_emitters_nm(
     mesh_path=MESH_PATH,
@@ -165,11 +142,9 @@ if USE_GAUSSIAN_PSF:
         xy_um_per_px=XY_UM_PER_PX,
         z_step_um=Z_STEP_UM,
     )
-    save_psf_and_mips(psf_eff, "psf_gaussian_matched")
     psf_tag = "gaussian_matched"
 else:
     psf_eff = load_psf_zyx(PSF_EM_TIF)
-    save_psf_and_mips(psf_eff, "psf_bornwolf_fiji")
     psf_tag = "bornwolf_fiji"
 
 # -----------------------------
