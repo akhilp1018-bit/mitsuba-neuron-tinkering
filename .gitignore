@@ -8,6 +8,13 @@ __pycache__/
 venv/
 .vscode/
 
+# Data / meshes
+neuron/
+../neuron/
+*.ply
+*.obj
+*.stl
+
 # Output files
 zstack_out/
 *.tif
