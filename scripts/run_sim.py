@@ -6,7 +6,8 @@ import tifffile
 import trimesh
 
 from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
-
+from src.sampling import sample_thickshell_emitters_nm
+from src.splat import splat_emitters_with_psf_zyx
 mi.set_variant("scalar_rgb")
 
 # -----------------------------
@@ -127,20 +128,14 @@ print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
 # -----------------------------
 # 2) Thick-shell emitters (Trimesh)
 # -----------------------------
-tm = trimesh.load(MESH_PATH, force="mesh", process=False)
-rng = np.random.default_rng(RNG_SEED)
+points = sample_thickshell_emitters_nm(
+    mesh_path=MESH_PATH,
+    num_emitters=NUM_EMITTERS,
+    thickness_um=THICKNESS_UM,
+    jitter_um=JITTER_UM,
+    rng_seed=RNG_SEED,
+)
 
-surf_pts, face_idx = trimesh.sample.sample_surface(tm, NUM_EMITTERS)
-face_normals = tm.face_normals[face_idx]
-
-THICKNESS_NM = THICKNESS_UM * 1000.0
-JITTER_NM = JITTER_UM * 1000.0
-
-depth_nm = rng.uniform(0.0, THICKNESS_NM, size=(NUM_EMITTERS, 1)).astype(np.float32)
-pts_in = surf_pts.astype(np.float32) - face_normals.astype(np.float32) * depth_nm
-pts_in += rng.normal(0.0, JITTER_NM, size=pts_in.shape).astype(np.float32)
-
-points = pts_in
 print(f"Generated {points.shape[0]:,} thick-shell emitters")
 
 # -----------------------------
@@ -192,33 +187,17 @@ print(f"Neuron depth: {depth_nm_total/1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}
 # -----------------------------
 # 6) Splat into volume (Z,Y,X)
 # -----------------------------
-vol = np.zeros((NUM_SLICES, H, W), dtype=np.float16)
-
-k = np.round((z - zmin) / Z_STEP_NM).astype(np.int32)
-valid = (k >= 0) & (k < NUM_SLICES)
-u_i = np.round(u[valid]).astype(np.int32)
-v_i = np.round(v[valid]).astype(np.int32)
-k_i = k[valid]
-print(f"Emitters used after Z indexing: {len(k_i):,}")
-
-for x0, y0, z0 in zip(u_i, v_i, k_i):
-    oz0 = z0 - cz
-    oz1 = oz0 + pz
-    oy0 = y0 - cy
-    oy1 = oy0 + py
-    ox0 = x0 - cx
-    ox1 = ox0 + px
-
-    vz0 = max(0, oz0); vz1 = min(NUM_SLICES, oz1)
-    vy0 = max(0, oy0); vy1 = min(H, oy1)
-    vx0 = max(0, ox0); vx1 = min(W, ox1)
-
-    pz0 = vz0 - oz0; pz1 = pz0 + (vz1 - vz0)
-    py0 = vy0 - oy0; py1 = py0 + (vy1 - vy0)
-    px0 = vx0 - ox0; px1 = px0 + (vx1 - vx0)
-
-    vol[vz0:vz1, vy0:vy1, vx0:vx1] += psf_eff[pz0:pz1, py0:py1, px0:px1].astype(np.float16)
-
+vol = splat_emitters_with_psf_zyx(
+    u=u,
+    v=v,
+    z_nm=z,
+    zmin_nm=zmin,
+    num_slices=NUM_SLICES,
+    H=H,
+    W=W,
+    z_step_nm=Z_STEP_NM,
+    psf_zyx=psf_eff,
+)
 # -----------------------------
 # 7) Save ImageJ Z-stack
 # -----------------------------
