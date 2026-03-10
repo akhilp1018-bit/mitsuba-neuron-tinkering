@@ -2,13 +2,15 @@ import numpy as np
 import tifffile
 
 def load_psf_zyx(path: str) -> np.ndarray:
-    """Load PSF TIFF and return float32 array in (Z,Y,X), normalized to max=1."""
+    """Load PSF TIFF and return float32 array in (Z,Y,X), normalized to sum=1."""
     arr = tifffile.imread(path).astype(np.float32)
+
     if arr.shape == (64, 64, 13):
         arr = np.transpose(arr, (2, 0, 1))
     elif arr.shape != (13, 64, 64):
         arr = np.moveaxis(arr, int(np.argmin(arr.shape)), 0)
-    arr /= (arr.max() + 1e-12)
+
+    arr /= (arr.sum() + 1e-12)
     return arr
 
 def fwhm_to_sigma(fwhm: float) -> float:
@@ -40,6 +42,14 @@ def make_gaussian_psf_matched_zyx(
     sigma_y_px = sigma_xy_um / xy_um_per_px
     sigma_z_px = sigma_z_um / z_step_um
 
+    # Broaden Gaussian slightly to better match Born-Wolf effective spread
+    GAUSSIAN_SIGMA_SCALE_XY = 1.3
+    GAUSSIAN_SIGMA_SCALE_Z = 1.3
+
+    sigma_x_px *= GAUSSIAN_SIGMA_SCALE_XY
+    sigma_y_px *= GAUSSIAN_SIGMA_SCALE_XY
+    sigma_z_px *= GAUSSIAN_SIGMA_SCALE_Z
+
     print("Gaussian PSF matched (approx):")
     print(f"  FWHM_xy ≈ {fwhm_xy_um:.3f} µm -> sigma_xy ≈ {sigma_xy_um:.3f} µm -> {sigma_x_px:.2f} px")
     print(f"  FWHM_z  ≈ {fwhm_z_um:.3f} µm -> sigma_z  ≈ {sigma_z_um:.3f} µm -> {sigma_z_px:.2f} px")
@@ -55,5 +65,7 @@ def make_gaussian_psf_matched_zyx(
           yy**2 / (2.0 * sigma_y_px**2) +
           xx**2 / (2.0 * sigma_x_px**2))
     ).astype(np.float32)
-    psf /= (psf.max() + 1e-12)
+
+    # Normalize total PSF energy
+    psf /= (psf.sum() + 1e-12)
     return psf

@@ -6,6 +6,11 @@ from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
 from src.splat import splat_emitters_with_psf_zyx
 from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
+from src.density_utils import (
+    points_to_density_zyx,
+    ensure_psf_odd_xy,
+    focal_stack_from_density,
+)
 
 mi.set_variant("scalar_rgb")
 
@@ -14,7 +19,7 @@ mi.set_variant("scalar_rgb")
 # -----------------------------
 MESH_PATH = "neuron/mesh_centered.ply"
 OUT_DIR = "scripts/zstack_out"
-PSF_EM_TIF = "scripts/psf_bornwolf_widefield_488nm_NA1_64x64x13.tif"
+PSF_EM_TIF = "scripts/psf_bornwolf_488nm_NA1_xy200nm_z500nm_65x65x13.tif"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # -----------------------------
@@ -28,28 +33,35 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # ROI settings
 # -----------------------------
 USE_ROI = True
-ROI_SIZE_UM_X = 200.0
-ROI_SIZE_UM_Y = 200.0
+ROI_SIZE_UM_X = 100.0
+ROI_SIZE_UM_Y = 100.0
 ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
 # -----------------------------
 # Thick-shell emitters
 # -----------------------------
-NUM_EMITTERS = 1_000_000
+NUM_EMITTERS = 3_000_000
 THICKNESS_UM = 2.0
 JITTER_UM = 0.3
 RNG_SEED = 0
 
 # -----------------------------
-# PSF selection + optics (match Fiji)
+# PSF selection + optics
 # -----------------------------
-USE_GAUSSIAN_PSF = False   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
+USE_GAUSSIAN_PSF = True   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
 
 LAMBDA_NM = 488.0
 NA = 1.0
-REF_INDEX = 1.0
-GAUSS_PSF_SHAPE_ZYX = (13, 64, 64)
+REF_INDEX = 1.33
+GAUSS_PSF_SHAPE_ZYX = (13, 65, 65)
+
+# -----------------------------
+# Choose image formation mode
+# -----------------------------
+# "splat": original emitter splatting
+# "density": density field + focal-plane PSF rendering
+MODE = "density"
 
 print("=== SETTINGS ===")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
@@ -57,6 +69,7 @@ print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
+print(f"Image formation MODE={MODE}")
 print("===============")
 
 # -----------------------------
@@ -125,10 +138,14 @@ v = (y - ymin) / (ymax - ymin) * (H - 1)
 v = (H - 1) - v
 
 inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-u = u[inside]
-v = v[inside]
-z = z[inside]
-print(f"Emitters inside ROI/FOV: {len(u):,}")
+
+u_in = u[inside]
+v_in = v[inside]
+z_in = z[inside]
+print(f"Emitters inside ROI/FOV: {len(u_in):,}")
+
+# ROI-filtered point list in nm (x,y,z) for density binning
+points_roi_nm = np.stack([x[inside], y[inside], z_in], axis=1).astype(np.float32)
 
 # -----------------------------
 # 4) PSF selection
@@ -147,6 +164,9 @@ else:
     psf_eff = load_psf_zyx(PSF_EM_TIF)
     psf_tag = "bornwolf_fiji"
 
+# Ensure odd XY for a defined PSF center
+psf_eff = ensure_psf_odd_xy(psf_eff, renormalize=True)
+
 # -----------------------------
 # 5) Full-depth Z stack
 # -----------------------------
@@ -155,28 +175,68 @@ NUM_SLICES = int(np.ceil(depth_nm_total / Z_STEP_NM)) + 1
 print(f"Neuron depth: {depth_nm_total/1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}")
 
 # -----------------------------
-# 6) Splat into volume (Z,Y,X)
+# 6) Image formation -> volume (Z,Y,X)
 # -----------------------------
-vol = splat_emitters_with_psf_zyx(
-    u=u,
-    v=v,
-    z_nm=z,
-    zmin_nm=zmin,
-    num_slices=NUM_SLICES,
-    H=H,
-    W=W,
-    z_step_nm=Z_STEP_NM,
-    psf_zyx=psf_eff,
-)
+if MODE == "splat":
+    vol = splat_emitters_with_psf_zyx(
+        u=u_in,
+        v=v_in,
+        z_nm=z_in,
+        zmin_nm=zmin,
+        num_slices=NUM_SLICES,
+        H=H,
+        W=W,
+        z_step_nm=Z_STEP_NM,
+        psf_zyx=psf_eff,
+    )
+
+elif MODE == "density":
+    # Define voxel sizes (nm) matching  output sampling
+    voxel_x_nm = XY_UM_PER_PX * 1000.0
+    voxel_y_nm = XY_UM_PER_PX * 1000.0
+    voxel_z_nm = Z_STEP_NM
+
+    # Grid origin is ROI lower corner in x/y, and mesh zmin for z
+    origin_nm = (xmin, ymin, zmin)
+
+    # Create density grid rho(z,y,x)
+    rho = points_to_density_zyx(
+        
+        points_nm=points_roi_nm,
+        origin_nm=origin_nm,
+        voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
+        shape_zyx=(NUM_SLICES, H, W),
+    )
+
+    print("rho:", rho.shape, "sum=", float(rho.sum()), "max=", float(rho.max()))
+
+    # Memory-safe focal-plane rendering
+    vol = focal_stack_from_density(rho, psf_eff)
+    
+
+else:
+    raise ValueError("MODE must be 'splat' or 'density'")
+
+# Optional sanity prints
+print("psf:", psf_eff.shape, "sum=", float(psf_eff.sum()))
+print("vol:", vol.shape, "min/max=", float(vol.min()), float(vol.max()))
 
 # -----------------------------
 # 7) Normalize + Save Z-stack + metadata
 # -----------------------------
-tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}"
+tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
 
-vol_f = vol.astype(np.float32)
+vol_f = vol.astype(np.float32, copy=False)
 vol_f /= (vol_f.max() + 1e-12)
-stack_u16 = (np.clip(vol_f, 0, 1) * 65535).astype(np.uint16)
+
+# in-place clip to avoid extra big allocation
+np.clip(vol_f, 0.0, 1.0, out=vol_f)
+
+# scale in-place
+vol_f *= 65535.0
+
+# final conversion
+stack_u16 = vol_f.astype(np.uint16)
 
 tiff_path = save_stack_imagej_zyx_u16(
     out_dir=OUT_DIR,
@@ -189,6 +249,7 @@ print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 
 meta_lines = [
     "=== Render metadata ===",
+    f"MODE={MODE}",
     f"PSF_MODE={psf_tag}",
     f"lambda_nm={LAMBDA_NM}",
     f"NA={NA}",
