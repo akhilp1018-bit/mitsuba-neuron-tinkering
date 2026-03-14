@@ -6,8 +6,10 @@ from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
 from src.splat import splat_emitters_with_psf_zyx
 from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
+from src.sampling import sample_mesh_surface_deterministic
 from src.density_utils import (
     points_to_density_zyx,
+    smooth_density_zyx,
     ensure_psf_odd_xy,
     focal_stack_from_density,
 )
@@ -20,6 +22,7 @@ mi.set_variant("scalar_rgb")
 MESH_PATH = "neuron/mesh_centered.ply"
 OUT_DIR = "scripts/zstack_out"
 PSF_EM_TIF = "scripts/psf_bornwolf_488nm_NA1_xy200nm_z500nm_65x65x13.tif"
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # -----------------------------
@@ -33,16 +36,17 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # ROI settings
 # -----------------------------
 USE_ROI = True
-ROI_SIZE_UM_X = 100.0
-ROI_SIZE_UM_Y = 100.0
+ROI_SIZE_UM_X = 200.0
+ROI_SIZE_UM_Y = 200.0
 ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
 # -----------------------------
 # Thick-shell emitters
 # -----------------------------
-NUM_EMITTERS = 3_000_000
+NUM_EMITTERS = 4_000_000
 THICKNESS_UM = 2.0
+
 JITTER_UM = 0.3
 RNG_SEED = 0
 
@@ -50,7 +54,6 @@ RNG_SEED = 0
 # PSF selection + optics
 # -----------------------------
 USE_GAUSSIAN_PSF = True   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
-
 LAMBDA_NM = 488.0
 NA = 1.0
 REF_INDEX = 1.33
@@ -63,6 +66,14 @@ GAUSS_PSF_SHAPE_ZYX = (13, 65, 65)
 # "density": density field + focal-plane PSF rendering
 MODE = "density"
 
+# -----------------------------
+# Density regularization
+# -----------------------------
+# Small smoothing in voxel units: (z, y, x)
+# This smooths the sampled density field before optical PSF rendering.
+DENSITY_SMOOTH_SIGMA_ZYX = (0.6, 0.8, 0.8)
+DENSITY_NORMALIZE_SUM = True
+
 print("=== SETTINGS ===")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
 print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER_MODE}, margin={MARGIN}")
@@ -70,6 +81,7 @@ print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={J
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
+print(f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}")
 print("===============")
 
 # -----------------------------
@@ -77,13 +89,16 @@ print("===============")
 # -----------------------------
 mesh = mi.load_dict({"type": "ply", "filename": MESH_PATH})
 bbox = mesh.bbox()
+
 xmin0, ymin0, zmin = float(bbox.min[0]), float(bbox.min[1]), float(bbox.min[2])
 xmax0, ymax0, zmax = float(bbox.max[0]), float(bbox.max[1]), float(bbox.max[2])
+
 print(f"Mesh bbox (nm): x[{xmin0:.1f},{xmax0:.1f}] y[{ymin0:.1f},{ymax0:.1f}] z[{zmin:.1f},{zmax:.1f}]")
 
 # Expand bbox for ROI centering
 xrange_nm = xmax0 - xmin0
 yrange_nm = ymax0 - ymin0
+
 xmin_m = xmin0 - MARGIN * xrange_nm
 xmax_m = xmax0 + MARGIN * xrange_nm
 ymin_m = ymin0 - MARGIN * yrange_nm
@@ -93,14 +108,18 @@ ymax_m = ymax0 + MARGIN * yrange_nm
 if USE_ROI:
     if ROI_CENTER_MODE != "bbox_center":
         raise ValueError("ROI_CENTER_MODE not recognized. Use 'bbox_center'.")
+
     cx_nm = 0.5 * (xmin_m + xmax_m)
     cy_nm = 0.5 * (ymin_m + ymax_m)
+
     halfx_nm = (ROI_SIZE_UM_X * 1000.0) * 0.5
     halfy_nm = (ROI_SIZE_UM_Y * 1000.0) * 0.5
+
     xmin = cx_nm - halfx_nm
     xmax = cx_nm + halfx_nm
     ymin = cy_nm - halfy_nm
     ymax = cy_nm + halfy_nm
+
     print(f"Using ROI bbox (nm): x[{xmin:.1f},{xmax:.1f}] y[{ymin:.1f},{ymax:.1f}]")
 else:
     xmin, xmax, ymin, ymax = xmin_m, xmax_m, ymin_m, ymax_m
@@ -109,21 +128,31 @@ else:
 # Compute image size from physical pixel size
 xspan_um = (xmax - xmin) / 1000.0
 yspan_um = (ymax - ymin) / 1000.0
+
 W = int(np.ceil(xspan_um / XY_UM_PER_PX)) + 1
 H = int(np.ceil(yspan_um / XY_UM_PER_PX)) + 1
+
 print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
+
+
+
+points = sample_mesh_surface_deterministic(
+    mesh_path=MESH_PATH,
+    spacing_nm=200.0
+)
 
 # -----------------------------
 # 2) Thick-shell emitters
 # -----------------------------
-points = sample_thickshell_emitters_nm(
-    mesh_path=MESH_PATH,
-    num_emitters=NUM_EMITTERS,
-    thickness_um=THICKNESS_UM,
-    jitter_um=JITTER_UM,
-    rng_seed=RNG_SEED,
-)
+#points = sample_thickshell_emitters_nm(
+    #mesh_path=MESH_PATH,
+   # num_emitters=NUM_EMITTERS,
+    #thickness_um=THICKNESS_UM,
+    #jitter_um=JITTER_UM,
+   # rng_seed=RNG_SEED,
+#)
+
 print(f"Generated {points.shape[0]:,} thick-shell emitters")
 
 # -----------------------------
@@ -142,6 +171,7 @@ inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
 u_in = u[inside]
 v_in = v[inside]
 z_in = z[inside]
+
 print(f"Emitters inside ROI/FOV: {len(u_in):,}")
 
 # ROI-filtered point list in nm (x,y,z) for density binning
@@ -172,7 +202,8 @@ psf_eff = ensure_psf_odd_xy(psf_eff, renormalize=True)
 # -----------------------------
 depth_nm_total = float(zmax - zmin)
 NUM_SLICES = int(np.ceil(depth_nm_total / Z_STEP_NM)) + 1
-print(f"Neuron depth: {depth_nm_total/1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}")
+
+print(f"Neuron depth: {depth_nm_total / 1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}")
 
 # -----------------------------
 # 6) Image formation -> volume (Z,Y,X)
@@ -191,7 +222,7 @@ if MODE == "splat":
     )
 
 elif MODE == "density":
-    # Define voxel sizes (nm) matching  output sampling
+    # Define voxel sizes (nm) matching output sampling
     voxel_x_nm = XY_UM_PER_PX * 1000.0
     voxel_y_nm = XY_UM_PER_PX * 1000.0
     voxel_z_nm = Z_STEP_NM
@@ -199,20 +230,42 @@ elif MODE == "density":
     # Grid origin is ROI lower corner in x/y, and mesh zmin for z
     origin_nm = (xmin, ymin, zmin)
 
-    # Create density grid rho(z,y,x)
+    # 1) Raw density grid rho(z,y,x)
     rho = points_to_density_zyx(
-        
         points_nm=points_roi_nm,
         origin_nm=origin_nm,
         voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
         shape_zyx=(NUM_SLICES, H, W),
     )
 
-    print("rho:", rho.shape, "sum=", float(rho.sum()), "max=", float(rho.max()))
+    print(
+        "rho_raw:",
+        rho.shape,
+        "sum=",
+        float(rho.sum()),
+        "max=",
+        float(rho.max()),
+    )
 
-    # Memory-safe focal-plane rendering
+    # 2) Smooth density slightly to reduce grain/spikes from point binning
+    rho = smooth_density_zyx(
+        rho,
+        sigma_zyx=DENSITY_SMOOTH_SIGMA_ZYX,
+        normalize_sum=DENSITY_NORMALIZE_SUM,
+    )
+   
+
+    print(
+        "rho_smooth:",
+        rho.shape,
+        "sum=",
+        float(rho.sum()),
+        "max=",
+        float(rho.max()),
+    )
+
+    # 3) Memory-safe focal-plane rendering
     vol = focal_stack_from_density(rho, psf_eff)
-    
 
 else:
     raise ValueError("MODE must be 'splat' or 'density'")
@@ -245,6 +298,7 @@ tiff_path = save_stack_imagej_zyx_u16(
     xy_um_per_px=XY_UM_PER_PX,
     z_step_um=Z_STEP_UM,
 )
+
 print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 
 meta_lines = [
@@ -262,7 +316,11 @@ meta_lines = [
     f"W={W}",
     f"H={H}",
     f"NUM_SLICES={NUM_SLICES}",
+    f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
+    f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
 ]
+
 meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
 print("Saved metadata:", meta_txt)
+
 print("Done.")

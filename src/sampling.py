@@ -26,3 +26,40 @@ def sample_thickshell_emitters_nm(
     pts_in += rng.normal(0.0, jitter_nm, size=pts_in.shape).astype(np.float32)
 
     return pts_in
+
+
+
+def sample_mesh_surface_deterministic(mesh_path, spacing_nm=200.0):
+    """
+    Deterministic surface sampling instead of random emitters.
+    """
+
+    mesh = trimesh.load(mesh_path, process=False)
+
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.faces)
+
+    pts = []
+
+    for f in faces:
+        v0, v1, v2 = vertices[f]
+
+        # triangle area
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+
+        # number of samples based on area
+        n = max(1, int(np.ceil(area / (spacing_nm**2))))
+
+        m = int(np.ceil(np.sqrt(n)))
+
+        for i in range(m + 1):
+            for j in range(m + 1 - i):
+
+                a = i / max(m, 1)
+                b = j / max(m, 1)
+                c = 1 - a - b
+
+                p = a * v0 + b * v1 + c * v2
+                pts.append(p)
+
+    return np.array(pts, dtype=np.float32)
