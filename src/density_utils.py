@@ -1,7 +1,7 @@
 import numpy as np
+import trimesh
 from scipy.signal import fftconvolve
 from scipy.ndimage import gaussian_filter
-
 
 
 def focal_stack_from_density(rho_zyx, psf_zyx):
@@ -74,6 +74,56 @@ def points_to_density_zyx(points_nm, origin_nm, voxel_size_nm_xyz, shape_zyx, we
         w = weights[m].astype(np.float32)
 
     np.add.at(rho, (iz, iy, ix), w)
+    return rho
+
+
+def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, spacing_nm=200.0):
+    """
+    Deterministic mesh surface -> density grid rho[z,y,x].
+
+    mesh_path: path to mesh
+    origin_nm: (x0, y0, z0)
+    voxel_size_nm_xyz: (sx, sy, sz)
+    shape_zyx: (Z, Y, X)
+    spacing_nm: approximate surface sample spacing in nm
+    """
+    Z, Y, X = shape_zyx
+    rho = np.zeros((Z, Y, X), dtype=np.float32)
+
+    sx, sy, sz = voxel_size_nm_xyz
+    x0, y0, z0 = origin_nm
+
+    mesh = trimesh.load(mesh_path, process=False)
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+
+    for f in faces:
+        v0, v1, v2 = vertices[f]
+
+        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+        if area <= 0:
+            continue
+
+        n = max(1, int(np.ceil(area / (spacing_nm ** 2))))
+        m = int(np.ceil(np.sqrt(n)))
+
+        for i in range(m + 1):
+            for j in range(m + 1 - i):
+                a = i / max(m, 1)
+                b = j / max(m, 1)
+                c = 1.0 - a - b
+
+                p = a * v0 + b * v1 + c * v2
+
+                ix = int(np.floor((p[0] - x0) / sx))
+                iy = int(np.floor((p[1] - y0) / sy))
+                iz = int(np.floor((p[2] - z0) / sz))
+
+                iy = (Y - 1) - iy
+
+                if 0 <= ix < X and 0 <= iy < Y and 0 <= iz < Z:
+                    rho[iz, iy, ix] += 1.0
+
     return rho
 
 
