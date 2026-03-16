@@ -80,12 +80,7 @@ def points_to_density_zyx(points_nm, origin_nm, voxel_size_nm_xyz, shape_zyx, we
 def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, spacing_nm=200.0):
     """
     Deterministic mesh surface -> density grid rho[z,y,x].
-
-    mesh_path: path to mesh
-    origin_nm: (x0, y0, z0)
-    voxel_size_nm_xyz: (sx, sy, sz)
-    shape_zyx: (Z, Y, X)
-    spacing_nm: approximate surface sample spacing in nm
+    This corresponds to membrane/surface labeling.
     """
     Z, Y, X = shape_zyx
     rho = np.zeros((Z, Y, X), dtype=np.float32)
@@ -123,6 +118,47 @@ def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, spac
 
                 if 0 <= ix < X and 0 <= iy < Y and 0 <= iz < Z:
                     rho[iz, iy, ix] += 1.0
+
+    return rho
+
+
+def mesh_filled_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx):
+    """
+    Filled neuron labeling:
+    all voxels whose centers lie inside the mesh get fluorophore density.
+
+    Memory-safe version: process one z-slice at a time.
+    """
+    Z, Y, X = shape_zyx
+    sx, sy, sz = voxel_size_nm_xyz
+    x0, y0, z0 = origin_nm
+
+    rho = np.zeros((Z, Y, X), dtype=np.float32)
+
+    mesh = trimesh.load(mesh_path, process=False)
+
+    # x/y voxel-center coordinates
+    xs = x0 + (np.arange(X) + 0.5) * sx
+    ys = y0 + (np.arange(Y) + 0.5) * sy
+
+    XX, YY = np.meshgrid(xs, ys, indexing="xy")   # shape (Y, X)
+
+    for iz in range(Z):
+        zc = z0 + (iz + 0.5) * sz
+
+        pts = np.stack(
+            [
+                XX.ravel(),
+                YY.ravel(),
+                np.full(XX.size, zc, dtype=np.float64),
+            ],
+            axis=1,
+        )
+
+        inside = mesh.contains(pts).reshape(Y, X).astype(np.float32)
+
+        # flip Y to match image coordinates
+        rho[iz] = inside[::-1, :]
 
     return rho
 

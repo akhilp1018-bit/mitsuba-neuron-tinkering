@@ -9,6 +9,7 @@ from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
 from src.density_utils import (
     points_to_density_zyx,
     mesh_to_density_zyx,
+    mesh_filled_to_density_zyx,
     smooth_density_zyx,
     ensure_psf_odd_xy,
     focal_stack_from_density,
@@ -42,7 +43,8 @@ ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
 # -----------------------------
-# Thick-shell emitters (used only for splat mode)
+# Thick-shell emitters (used only for splat mode
+# or old points-based density mode)
 # -----------------------------
 NUM_EMITTERS = 4_000_000
 THICKNESS_UM = 2.0
@@ -50,10 +52,11 @@ JITTER_UM = 0.3
 RNG_SEED = 0
 
 # -----------------------------
-# Continuous density settings
+# Labeling / density settings
 # -----------------------------
+LABELING_MODE = "membrane"   # "membrane" or "filled"
 MESH_DENSITY_SPACING_NM = 300.0
-DENSITY_SOURCE = "mesh"   # "mesh" or "points"
+DENSITY_SOURCE = "mesh"      # "mesh" or "points"
 
 # -----------------------------
 # PSF selection + optics
@@ -77,15 +80,26 @@ MODE = "density"
 DENSITY_SMOOTH_SIGMA_ZYX = (0.6, 0.8, 0.8)
 DENSITY_NORMALIZE_SUM = True
 
+# -----------------------------
+# Intensity variation
+# -----------------------------
+USE_INTENSITY_VARIATION = True
+INTENSITY_VAR_STD = 0.10
+INTENSITY_VAR_SIGMA_ZYX = (2.0, 4.0, 4.0)
+INTENSITY_VAR_SEED = 0
+
 print("=== SETTINGS ===")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
 print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER_MODE}, margin={MARGIN}")
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
+print(f"LABELING_MODE={LABELING_MODE}")
 print(f"DENSITY_SOURCE={DENSITY_SOURCE}, MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}")
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
 print(f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}")
+print(f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}")
+print(f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}, INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}")
 print("===============")
 
 # -----------------------------
@@ -140,7 +154,7 @@ print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
 
 # -----------------------------
-# 2) Only generate emitter points if splat mode
+# 2) Only generate emitter points if needed
 # -----------------------------
 u_in = v_in = z_in = None
 points_roi_nm = None
@@ -225,13 +239,24 @@ elif MODE == "density":
     origin_nm = (xmin, ymin, zmin)
 
     if DENSITY_SOURCE == "mesh":
-        rho = mesh_to_density_zyx(
-            mesh_path=MESH_PATH,
-            origin_nm=origin_nm,
-            voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
-            shape_zyx=(NUM_SLICES, H, W),
-            spacing_nm=MESH_DENSITY_SPACING_NM,
-        )
+        if LABELING_MODE == "membrane":
+            rho = mesh_to_density_zyx(
+                mesh_path=MESH_PATH,
+                origin_nm=origin_nm,
+                voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
+                shape_zyx=(NUM_SLICES, H, W),
+                spacing_nm=MESH_DENSITY_SPACING_NM,
+            )
+        elif LABELING_MODE == "filled":
+            rho = mesh_filled_to_density_zyx(
+                mesh_path=MESH_PATH,
+                origin_nm=origin_nm,
+                voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
+                shape_zyx=(NUM_SLICES, H, W),
+            )
+        else:
+            raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
+
     elif DENSITY_SOURCE == "points":
         rho = points_to_density_zyx(
             points_nm=points_roi_nm,
@@ -266,6 +291,35 @@ elif MODE == "density":
         float(rho.max()),
     )
 
+    # Apply smooth random intensity variation to fluorophore density
+    if USE_INTENSITY_VARIATION:
+        rng = np.random.default_rng(INTENSITY_VAR_SEED)
+
+        weights = rng.normal(
+            loc=1.0,
+            scale=INTENSITY_VAR_STD,
+            size=rho.shape,
+        ).astype(np.float32)
+
+        weights = smooth_density_zyx(
+            weights,
+            sigma_zyx=INTENSITY_VAR_SIGMA_ZYX,
+            normalize_sum=False,
+        )
+
+        weights = np.clip(weights, 0.0, None)
+
+        rho = rho * weights
+
+        print(
+            "rho_varied:",
+            rho.shape,
+            "sum=",
+            float(rho.sum()),
+            "max=",
+            float(rho.max()),
+        )
+
     vol = focal_stack_from_density(rho, psf_eff)
 
 else:
@@ -277,7 +331,7 @@ print("vol:", vol.shape, "min/max=", float(vol.min()), float(vol.max()))
 # -----------------------------
 # 6) Normalize + Save Z-stack + metadata
 # -----------------------------
-tag = f"EMonly_thickshell_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}_{DENSITY_SOURCE}"
+tag = f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}_{DENSITY_SOURCE}"
 
 vol_f = vol.astype(np.float32, copy=False)
 vol_f /= (vol_f.max() + 1e-12)
@@ -299,6 +353,7 @@ print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 meta_lines = [
     "=== Render metadata ===",
     f"MODE={MODE}",
+    f"LABELING_MODE={LABELING_MODE}",
     f"DENSITY_SOURCE={DENSITY_SOURCE}",
     f"MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}",
     f"PSF_MODE={psf_tag}",
@@ -315,6 +370,10 @@ meta_lines = [
     f"NUM_SLICES={NUM_SLICES}",
     f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
     f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
+    f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}",
+    f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
+    f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
+    f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
 ]
 
 meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
