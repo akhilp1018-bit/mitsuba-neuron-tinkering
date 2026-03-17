@@ -54,14 +54,14 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "membrane"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 300.0
+LABELING_MODE = "filled"   # "membrane" or "filled"
+MESH_DENSITY_SPACING_NM = 150.0
 DENSITY_SOURCE = "mesh"      # "mesh" or "points"
 
 # -----------------------------
 # PSF selection + optics
 # -----------------------------
-USE_GAUSSIAN_PSF = True   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
+USE_GAUSSIAN_PSF = False   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
 LAMBDA_NM = 488.0
 NA = 1.0
 REF_INDEX = 1.33
