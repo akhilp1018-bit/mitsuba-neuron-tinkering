@@ -37,8 +37,8 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # ROI settings
 # -----------------------------
 USE_ROI = True
-ROI_SIZE_UM_X = 200.0
-ROI_SIZE_UM_Y = 200.0
+ROI_SIZE_UM_X = 100.0
+ROI_SIZE_UM_Y = 100.0
 ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
