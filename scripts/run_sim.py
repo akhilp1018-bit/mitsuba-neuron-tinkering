@@ -55,7 +55,7 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "filled"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 150.0
+MESH_DENSITY_SPACING_NM = 300.0
 DENSITY_SOURCE = "mesh"      # "mesh" or "points"
 
 # -----------------------------
@@ -83,7 +83,7 @@ DENSITY_NORMALIZE_SUM = True
 # -----------------------------
 # Intensity variation
 # -----------------------------
-USE_INTENSITY_VARIATION = True
+USE_INTENSITY_VARIATION = False
 INTENSITY_VAR_STD = 0.10
 INTENSITY_VAR_SIGMA_ZYX = (2.0, 4.0, 4.0)
 INTENSITY_VAR_SEED = 0
