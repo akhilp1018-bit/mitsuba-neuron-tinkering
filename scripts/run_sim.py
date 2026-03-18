@@ -55,7 +55,7 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "filled"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 300.0
+MESH_DENSITY_SPACING_NM = 500.0
 DENSITY_SOURCE = "mesh"      # "mesh" or "points"
 
 # -----------------------------
