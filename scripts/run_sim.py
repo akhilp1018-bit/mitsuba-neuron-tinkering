@@ -61,8 +61,8 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "membrane"   # "membrane" or "filled"
-SPACING_LIST_NM = [100.0, 150.0, 200.0, 300.0, 500.0]
+LABELING_MODE = "filled"   # "membrane" or "filled"
+SPACING_LIST_NM = [200] #[100.0, 150.0, 200.0, 300.0, 500.0]
 BATCH_FACES = 2048
 
 # -----------------------------
