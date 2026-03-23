@@ -1,4 +1,8 @@
+import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import time
+
 import numpy as np
 import torch
 import mitsuba as mi
@@ -40,8 +44,8 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # ROI settings
 # -----------------------------
 USE_ROI = True
-ROI_SIZE_UM_X = 200.0
-ROI_SIZE_UM_Y = 200.0
+ROI_SIZE_UM_X = 50.0
+ROI_SIZE_UM_Y = 50.0
 ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
@@ -58,7 +62,8 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "membrane"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 200.0
+MESH_DENSITY_SPACING_NM = 500.0
+BATCH_FACES = 2048
 
 # -----------------------------
 # PSF selection + optics
@@ -96,6 +101,7 @@ print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
 print(f"LABELING_MODE={LABELING_MODE}")
 print(f"MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}")
+print(f"BATCH_FACES={BATCH_FACES}")
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
@@ -238,6 +244,7 @@ elif MODE == "density":
     origin_nm = (xmin, ymin, zmin)
 
     if LABELING_MODE == "membrane":
+        t0 = time.time()
         rho = mesh_to_density_zyx(
             mesh_path=MESH_PATH,
             origin_nm=origin_nm,
@@ -245,8 +252,14 @@ elif MODE == "density":
             shape_zyx=(NUM_SLICES, H, W),
             spacing_nm=MESH_DENSITY_SPACING_NM,
             device=device,
+            batch_faces=BATCH_FACES,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        print("mesh_to_density time:", time.time() - t0)
+
     elif LABELING_MODE == "filled":
+        t0 = time.time()
         rho = mesh_filled_to_density_zyx(
             mesh_path=MESH_PATH,
             origin_nm=origin_nm,
@@ -254,6 +267,10 @@ elif MODE == "density":
             shape_zyx=(NUM_SLICES, H, W),
             device=device,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        print("mesh_filled_to_density time:", time.time() - t0)
+
     else:
         raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
 
@@ -266,12 +283,16 @@ elif MODE == "density":
         float(rho.max().item()),
     )
 
+    t0 = time.time()
     rho = smooth_density_zyx(
         rho,
         sigma_zyx=DENSITY_SMOOTH_SIGMA_ZYX,
         normalize_sum=DENSITY_NORMALIZE_SUM,
         device=device,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    print("smooth_density time:", time.time() - t0)
 
     print(
         "rho_smooth:",
@@ -290,12 +311,16 @@ elif MODE == "density":
             rho.shape, dtype=torch.float32, device=device
         )
 
+        t0 = time.time()
         weights = smooth_density_zyx(
             weights,
             sigma_zyx=INTENSITY_VAR_SIGMA_ZYX,
             normalize_sum=False,
             device=device,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        print("intensity_variation_smooth time:", time.time() - t0)
 
         weights = torch.clamp(weights, min=0.0)
         rho = rho * weights
@@ -309,7 +334,11 @@ elif MODE == "density":
             float(rho.max().item()),
         )
 
+    t0 = time.time()
     vol = focal_stack_from_density(rho, psf_eff, device=device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    print("focal_stack time:", time.time() - t0)
 
 else:
     raise ValueError("MODE must be 'splat' or 'density'")
@@ -358,6 +387,7 @@ meta_lines = [
     f"MODE={MODE}",
     f"LABELING_MODE={LABELING_MODE}",
     f"MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}",
+    f"BATCH_FACES={BATCH_FACES}",
     f"PSF_MODE={psf_tag}",
     f"lambda_nm={LAMBDA_NM}",
     f"NA={NA}",

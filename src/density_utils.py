@@ -33,7 +33,6 @@ def focal_stack_from_density(rho_zyx, psf_zyx, device=None):
     if rho_zyx.ndim != 3 or psf_zyx.ndim != 3:
         raise ValueError("rho_zyx and psf_zyx must both be 3D")
 
-    # conv3d is correlation, so flip for true convolution
     kernel = torch.flip(psf_zyx, dims=(0, 1, 2))
 
     inp = rho_zyx.unsqueeze(0).unsqueeze(0)   # (1,1,Z,Y,X)
@@ -66,16 +65,24 @@ def _triangle_barycentric_grid(m, device):
     return torch.stack([a, b, c], dim=1)  # (N,3)
 
 
-def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx,
-                        spacing_nm=200.0, device=None):
+def mesh_to_density_zyx(
+    mesh_path,
+    origin_nm,
+    voxel_size_nm_xyz,
+    shape_zyx,
+    spacing_nm=500.0,
+    device=None,
+    batch_faces=2048,
+):
     """
     Deterministic mesh surface -> density grid rho[z,y,x].
     This corresponds to membrane/surface labeling.
 
-    Improvements:
-    - direct torch accumulation
-    - batched voxel indexing
-    - scatter_add_ instead of rho[iz,iy,ix] += 1 inside loops
+    Batched GPU-friendly version:
+    - compute face areas vectorized
+    - group faces by same barycentric grid size m
+    - process many triangles at once
+    - do one scatter_add_ per batch
     """
     device = get_device(device)
 
@@ -98,50 +105,75 @@ def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx,
     rho = torch.zeros((Z, Y, X), dtype=torch.float32, device=device)
     rho_flat = rho.view(-1)
 
-    for f in faces:
-        tri = vertices[f]  # (3,3)
-        v0, v1, v2 = tri[0], tri[1], tri[2]
+    tris = vertices[faces]  # (F,3,3)
+    v0 = tris[:, 0, :]
+    v1 = tris[:, 1, :]
+    v2 = tris[:, 2, :]
 
-        area = 0.5 * torch.linalg.norm(torch.cross(v1 - v0, v2 - v0, dim=0))
-        area_val = float(area)
-        if area_val <= 0.0:
+    areas = 0.5 * torch.linalg.norm(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
+
+    valid_faces = areas > 0
+    if not torch.any(valid_faces):
+        return rho
+
+    tris = tris[valid_faces]
+    areas = areas[valid_faces]
+
+    n_per_face = torch.clamp(
+        torch.ceil(areas / (spacing_nm ** 2)).long(),
+        min=1,
+    )
+    m_per_face = torch.ceil(torch.sqrt(n_per_face.float())).long()
+
+    unique_m = torch.unique(m_per_face)
+
+    for m_val in unique_m.tolist():
+        sel = (m_per_face == m_val)
+        tris_m = tris[sel]  # (Fm,3,3)
+
+        if tris_m.shape[0] == 0:
             continue
 
-        n = max(1, int(math.ceil(area_val / (spacing_nm ** 2))))
-        m = int(math.ceil(math.sqrt(n)))
+        bary = _triangle_barycentric_grid(int(m_val), device=device)  # (P,3)
 
-        bary = _triangle_barycentric_grid(m, device=device)  # (N,3)
+        for start in range(0, tris_m.shape[0], batch_faces):
+            tri_batch = tris_m[start:start + batch_faces]  # (B,3,3)
 
-        # p = a*v0 + b*v1 + c*v2
-        pts = (
-            bary[:, 0:1] * v0.unsqueeze(0) +
-            bary[:, 1:2] * v1.unsqueeze(0) +
-            bary[:, 2:3] * v2.unsqueeze(0)
-        )  # (N,3)
+            vb0 = tri_batch[:, 0, :]  # (B,3)
+            vb1 = tri_batch[:, 1, :]
+            vb2 = tri_batch[:, 2, :]
 
-        ix = torch.floor((pts[:, 0] - x0) / sx).long()
-        iy = torch.floor((pts[:, 1] - y0) / sy).long()
-        iz = torch.floor((pts[:, 2] - z0) / sz).long()
+            pts = (
+                bary[None, :, 0:1] * vb0[:, None, :] +
+                bary[None, :, 1:2] * vb1[:, None, :] +
+                bary[None, :, 2:3] * vb2[:, None, :]
+            )  # (B,P,3)
 
-        iy = (Y - 1) - iy
+            pts = pts.reshape(-1, 3)  # (B*P,3)
 
-        valid = (
-            (ix >= 0) & (ix < X) &
-            (iy >= 0) & (iy < Y) &
-            (iz >= 0) & (iz < Z)
-        )
+            ix = torch.floor((pts[:, 0] - x0) / sx).long()
+            iy = torch.floor((pts[:, 1] - y0) / sy).long()
+            iz = torch.floor((pts[:, 2] - z0) / sz).long()
 
-        if not torch.any(valid):
-            continue
+            iy = (Y - 1) - iy
 
-        ix = ix[valid]
-        iy = iy[valid]
-        iz = iz[valid]
+            valid = (
+                (ix >= 0) & (ix < X) &
+                (iy >= 0) & (iy < Y) &
+                (iz >= 0) & (iz < Z)
+            )
 
-        flat_idx = iz * (Y * X) + iy * X + ix
-        vals = torch.ones_like(flat_idx, dtype=torch.float32)
+            if not torch.any(valid):
+                continue
 
-        rho_flat.scatter_add_(0, flat_idx, vals)
+            ix = ix[valid]
+            iy = iy[valid]
+            iz = iz[valid]
+
+            flat_idx = iz * (Y * X) + iy * X + ix
+            vals = torch.ones(flat_idx.shape[0], dtype=torch.float32, device=device)
+
+            rho_flat.scatter_add_(0, flat_idx, vals)
 
     return rho
 
