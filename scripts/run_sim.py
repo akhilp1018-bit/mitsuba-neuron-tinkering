@@ -44,8 +44,8 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # ROI settings
 # -----------------------------
 USE_ROI = True
-ROI_SIZE_UM_X = 50.0
-ROI_SIZE_UM_Y = 50.0
+ROI_SIZE_UM_X = 200.0
+ROI_SIZE_UM_Y = 200.0
 ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
@@ -62,7 +62,7 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "membrane"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 500.0
+MESH_DENSITY_SPACING_NM = 150.0
 BATCH_FACES = 2048
 
 # -----------------------------

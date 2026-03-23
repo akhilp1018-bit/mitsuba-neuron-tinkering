@@ -70,7 +70,7 @@ def mesh_to_density_zyx(
     origin_nm,
     voxel_size_nm_xyz,
     shape_zyx,
-    spacing_nm=500.0,
+    spacing_nm=150.0,
     device=None,
     batch_faces=2048,
 ):
