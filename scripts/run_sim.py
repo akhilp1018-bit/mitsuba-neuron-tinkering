@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import torch
 import mitsuba as mi
 
 from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
@@ -7,7 +8,6 @@ from src.sampling import sample_thickshell_emitters_nm
 from src.splat import splat_emitters_with_psf_zyx
 from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
 from src.density_utils import (
-    points_to_density_zyx,
     mesh_to_density_zyx,
     mesh_filled_to_density_zyx,
     smooth_density_zyx,
@@ -16,6 +16,9 @@ from src.density_utils import (
 )
 
 mi.set_variant("scalar_rgb")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
 # -----------------------------
 # Paths
@@ -43,8 +46,8 @@ ROI_CENTER_MODE = "bbox_center"
 MARGIN = 0.05
 
 # -----------------------------
-# Thick-shell emitters (used only for splat mode
-# or old points-based density mode)
+# Thick-shell emitters
+# (used only for splat mode)
 # -----------------------------
 NUM_EMITTERS = 4_000_000
 THICKNESS_UM = 2.0
@@ -54,14 +57,13 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "filled"   # "membrane" or "filled"
-MESH_DENSITY_SPACING_NM = 500.0
-DENSITY_SOURCE = "mesh"      # "mesh" or "points"
+LABELING_MODE = "membrane"   # "membrane" or "filled"
+MESH_DENSITY_SPACING_NM = 200.0
 
 # -----------------------------
 # PSF selection + optics
 # -----------------------------
-USE_GAUSSIAN_PSF = False   # True: Gaussian in Python, False: Born&Wolf TIFF from Fiji
+USE_GAUSSIAN_PSF = False
 LAMBDA_NM = 488.0
 NA = 1.0
 REF_INDEX = 1.33
@@ -71,7 +73,7 @@ GAUSS_PSF_SHAPE_ZYX = (13, 65, 65)
 # Choose image formation mode
 # -----------------------------
 # "splat": original emitter splatting
-# "density": density field + focal-plane PSF rendering
+# "density": density field + 3D PSF rendering
 MODE = "density"
 
 # -----------------------------
@@ -93,7 +95,7 @@ print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
 print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER_MODE}, margin={MARGIN}")
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
 print(f"LABELING_MODE={LABELING_MODE}")
-print(f"DENSITY_SOURCE={DENSITY_SOURCE}, MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}")
+print(f"MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}")
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
@@ -154,12 +156,11 @@ print(f"Auto image size: W={W}, H={H}")
 print(f"FOV: {xspan_um:.2f} µm × {yspan_um:.2f} µm")
 
 # -----------------------------
-# 2) Only generate emitter points if needed
+# 2) Generate emitter points only for splat mode
 # -----------------------------
 u_in = v_in = z_in = None
-points_roi_nm = None
 
-if MODE == "splat" or DENSITY_SOURCE == "points":
+if MODE == "splat":
     points = sample_thickshell_emitters_nm(
         mesh_path=MESH_PATH,
         num_emitters=NUM_EMITTERS,
@@ -186,8 +187,6 @@ if MODE == "splat" or DENSITY_SOURCE == "points":
 
     print(f"Emitters inside ROI/FOV: {len(u_in):,}")
 
-    points_roi_nm = np.stack([x[inside], y[inside], z_in], axis=1).astype(np.float32)
-
 # -----------------------------
 # 3) PSF selection
 # -----------------------------
@@ -205,7 +204,7 @@ else:
     psf_eff = load_psf_zyx(PSF_EM_TIF)
     psf_tag = "bornwolf_fiji"
 
-psf_eff = ensure_psf_odd_xy(psf_eff, renormalize=True)
+psf_eff = ensure_psf_odd_xy(psf_eff, renormalize=True, device=device)
 
 # -----------------------------
 # 4) Full-depth Z stack
@@ -228,7 +227,7 @@ if MODE == "splat":
         H=H,
         W=W,
         z_step_nm=Z_STEP_NM,
-        psf_zyx=psf_eff,
+        psf_zyx=psf_eff.detach().cpu().numpy(),
     )
 
 elif MODE == "density":
@@ -238,102 +237,105 @@ elif MODE == "density":
 
     origin_nm = (xmin, ymin, zmin)
 
-    if DENSITY_SOURCE == "mesh":
-        if LABELING_MODE == "membrane":
-            rho = mesh_to_density_zyx(
-                mesh_path=MESH_PATH,
-                origin_nm=origin_nm,
-                voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
-                shape_zyx=(NUM_SLICES, H, W),
-                spacing_nm=MESH_DENSITY_SPACING_NM,
-            )
-        elif LABELING_MODE == "filled":
-            rho = mesh_filled_to_density_zyx(
-                mesh_path=MESH_PATH,
-                origin_nm=origin_nm,
-                voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
-                shape_zyx=(NUM_SLICES, H, W),
-            )
-        else:
-            raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
-
-    elif DENSITY_SOURCE == "points":
-        rho = points_to_density_zyx(
-            points_nm=points_roi_nm,
+    if LABELING_MODE == "membrane":
+        rho = mesh_to_density_zyx(
+            mesh_path=MESH_PATH,
             origin_nm=origin_nm,
             voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
             shape_zyx=(NUM_SLICES, H, W),
+            spacing_nm=MESH_DENSITY_SPACING_NM,
+            device=device,
+        )
+    elif LABELING_MODE == "filled":
+        rho = mesh_filled_to_density_zyx(
+            mesh_path=MESH_PATH,
+            origin_nm=origin_nm,
+            voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
+            shape_zyx=(NUM_SLICES, H, W),
+            device=device,
         )
     else:
-        raise ValueError("DENSITY_SOURCE must be 'mesh' or 'points'")
+        raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
 
     print(
         "rho_raw:",
-        rho.shape,
+        tuple(rho.shape),
         "sum=",
-        float(rho.sum()),
+        float(rho.sum().item()),
         "max=",
-        float(rho.max()),
+        float(rho.max().item()),
     )
 
     rho = smooth_density_zyx(
         rho,
         sigma_zyx=DENSITY_SMOOTH_SIGMA_ZYX,
         normalize_sum=DENSITY_NORMALIZE_SUM,
+        device=device,
     )
 
     print(
         "rho_smooth:",
-        rho.shape,
+        tuple(rho.shape),
         "sum=",
-        float(rho.sum()),
+        float(rho.sum().item()),
         "max=",
-        float(rho.max()),
+        float(rho.max().item()),
     )
 
     # Apply smooth random intensity variation to fluorophore density
     if USE_INTENSITY_VARIATION:
-        rng = np.random.default_rng(INTENSITY_VAR_SEED)
+        torch.manual_seed(INTENSITY_VAR_SEED)
 
-        weights = rng.normal(
-            loc=1.0,
-            scale=INTENSITY_VAR_STD,
-            size=rho.shape,
-        ).astype(np.float32)
+        weights = 1.0 + INTENSITY_VAR_STD * torch.randn(
+            rho.shape, dtype=torch.float32, device=device
+        )
 
         weights = smooth_density_zyx(
             weights,
             sigma_zyx=INTENSITY_VAR_SIGMA_ZYX,
             normalize_sum=False,
+            device=device,
         )
 
-        weights = np.clip(weights, 0.0, None)
-
+        weights = torch.clamp(weights, min=0.0)
         rho = rho * weights
 
         print(
             "rho_varied:",
-            rho.shape,
+            tuple(rho.shape),
             "sum=",
-            float(rho.sum()),
+            float(rho.sum().item()),
             "max=",
-            float(rho.max()),
+            float(rho.max().item()),
         )
 
-    vol = focal_stack_from_density(rho, psf_eff)
+    vol = focal_stack_from_density(rho, psf_eff, device=device)
 
 else:
     raise ValueError("MODE must be 'splat' or 'density'")
 
-print("psf:", psf_eff.shape, "sum=", float(psf_eff.sum()))
-print("vol:", vol.shape, "min/max=", float(vol.min()), float(vol.max()))
+# -----------------------------
+# 6) Convert to numpy if needed
+# -----------------------------
+if isinstance(vol, torch.Tensor):
+    vol_np = vol.detach().cpu().numpy()
+else:
+    vol_np = vol.astype(np.float32, copy=False)
+
+if isinstance(psf_eff, torch.Tensor):
+    psf_np = psf_eff.detach().cpu().numpy()
+else:
+    psf_np = psf_eff
+
+print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
+print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
 
 # -----------------------------
-# 6) Normalize + Save Z-stack + metadata
+# 7) Normalize + Save Z-stack + metadata
 # -----------------------------
-tag = f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}_{DENSITY_SOURCE}"
+tag = f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
 
-vol_f = vol.astype(np.float32, copy=False)
+vol_f = vol_np.astype(np.float32, copy=False)
 vol_f /= (vol_f.max() + 1e-12)
 
 np.clip(vol_f, 0.0, 1.0, out=vol_f)
@@ -352,9 +354,9 @@ print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
 
 meta_lines = [
     "=== Render metadata ===",
+    f"DEVICE={device}",
     f"MODE={MODE}",
     f"LABELING_MODE={LABELING_MODE}",
-    f"DENSITY_SOURCE={DENSITY_SOURCE}",
     f"MESH_DENSITY_SPACING_NM={MESH_DENSITY_SPACING_NM}",
     f"PSF_MODE={psf_tag}",
     f"lambda_nm={LAMBDA_NM}",

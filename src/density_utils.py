@@ -1,199 +1,258 @@
+import math
 import numpy as np
+import torch
+import torch.nn.functional as F
 import trimesh
-from scipy.signal import fftconvolve
-from scipy.ndimage import gaussian_filter
 
 
-def focal_stack_from_density(rho_zyx, psf_zyx):
+def get_device(device=None):
+    if device is not None:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def as_torch(x, device=None, dtype=torch.float32):
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=dtype)
+    return torch.as_tensor(x, device=device, dtype=dtype)
+
+
+def focal_stack_from_density(rho_zyx, psf_zyx, device=None):
     """
-    Memory-light focal plane simulation:
-    For each z slice, sum XY convolutions of nearby rho slices weighted by PSF(z).
+    Full 3D convolution in PyTorch.
 
     rho_zyx: (Z, Y, X)
-    psf_zyx: (Zp, Yp, Xp) with odd Yp/Xp recommended
+    psf_zyx: (Zp, Yp, Xp)
     returns: vol_zyx (Z, Y, X)
     """
-    Z, H, W = rho_zyx.shape
+    device = get_device(device)
+
+    rho_zyx = as_torch(rho_zyx, device=device, dtype=torch.float32)
+    psf_zyx = as_torch(psf_zyx, device=device, dtype=torch.float32)
+
+    if rho_zyx.ndim != 3 or psf_zyx.ndim != 3:
+        raise ValueError("rho_zyx and psf_zyx must both be 3D")
+
+    # conv3d is correlation, so flip for true convolution
+    kernel = torch.flip(psf_zyx, dims=(0, 1, 2))
+
+    inp = rho_zyx.unsqueeze(0).unsqueeze(0)   # (1,1,Z,Y,X)
+    ker = kernel.unsqueeze(0).unsqueeze(0)    # (1,1,Zp,Yp,Xp)
+
     Zp, Yp, Xp = psf_zyx.shape
-    cz = Zp // 2
+    out = F.conv3d(inp, ker, padding=(Zp // 2, Yp // 2, Xp // 2))
 
-    vol = np.zeros_like(rho_zyx, dtype=np.float32)
-
-    rho_zyx = rho_zyx.astype(np.float32, copy=False)
-    psf_zyx = psf_zyx.astype(np.float32, copy=False)
-
-    for k in range(Z):
-        acc = np.zeros((H, W), dtype=np.float32)
-
-        for dz in range(-cz, cz + 1):
-            zsrc = k + dz
-            if zsrc < 0 or zsrc >= Z:
-                continue
-
-            kz = dz + cz
-            kernel_xy = psf_zyx[kz]
-            acc += fftconvolve(rho_zyx[zsrc], kernel_xy, mode="same").astype(
-                np.float32, copy=False
-            )
-
-        vol[k] = acc
-
-    return vol
+    return out[0, 0]
 
 
-def points_to_density_zyx(points_nm, origin_nm, voxel_size_nm_xyz, shape_zyx, weights=None):
+def _triangle_barycentric_grid(m, device):
     """
-    points_nm: (N,3) in nm, columns (x,y,z)
-    origin_nm: (3,) nm of grid origin (x0,y0,z0) corresponding to voxel (0,0,0)
-    voxel_size_nm_xyz: (sx,sy,sz) voxel size in nm
-    shape_zyx: (Z,Y,X)
-    weights: optional (N,) intensities per point
+    Return barycentric coefficients (a,b,c) for deterministic triangle sampling.
+    Number of samples = (m+1)(m+2)/2
     """
-    Z, Y, X = shape_zyx
-    rho = np.zeros((Z, Y, X), dtype=np.float32)
+    if m <= 0:
+        return torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
 
-    if points_nm is None or len(points_nm) == 0:
-        return rho
+    rows = []
+    for i in range(m + 1):
+        j = torch.arange(m + 1 - i, device=device, dtype=torch.float32)
+        ii = torch.full_like(j, float(i))
+        rows.append(torch.stack([ii, j], dim=1))
 
-    sx, sy, sz = voxel_size_nm_xyz
-    x0, y0, z0 = origin_nm
-
-    ix = np.floor((points_nm[:, 0] - x0) / sx).astype(np.int32)
-    iy = (Y - 1) - np.floor((points_nm[:, 1] - y0) / sy).astype(np.int32)
-    iz = np.floor((points_nm[:, 2] - z0) / sz).astype(np.int32)
-
-    m = (ix >= 0) & (ix < X) & (iy >= 0) & (iy < Y) & (iz >= 0) & (iz < Z)
-    ix, iy, iz = ix[m], iy[m], iz[m]
-
-    if weights is None:
-        w = np.ones(ix.shape[0], dtype=np.float32)
-    else:
-        weights = np.asarray(weights)
-        if weights.shape[0] != points_nm.shape[0]:
-            raise ValueError("weights must have same length as points_nm")
-        w = weights[m].astype(np.float32)
-
-    np.add.at(rho, (iz, iy, ix), w)
-    return rho
+    ij = torch.cat(rows, dim=0)  # (N,2)
+    a = ij[:, 0] / m
+    b = ij[:, 1] / m
+    c = 1.0 - a - b
+    return torch.stack([a, b, c], dim=1)  # (N,3)
 
 
-def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, spacing_nm=200.0):
+def mesh_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx,
+                        spacing_nm=200.0, device=None):
     """
     Deterministic mesh surface -> density grid rho[z,y,x].
     This corresponds to membrane/surface labeling.
-    """
-    Z, Y, X = shape_zyx
-    rho = np.zeros((Z, Y, X), dtype=np.float32)
 
+    Improvements:
+    - direct torch accumulation
+    - batched voxel indexing
+    - scatter_add_ instead of rho[iz,iy,ix] += 1 inside loops
+    """
+    device = get_device(device)
+
+    Z, Y, X = shape_zyx
     sx, sy, sz = voxel_size_nm_xyz
     x0, y0, z0 = origin_nm
 
     mesh = trimesh.load(mesh_path, process=False)
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.int32)
+    vertices = torch.as_tensor(
+        np.asarray(mesh.vertices, dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+    faces = torch.as_tensor(
+        np.asarray(mesh.faces, dtype=np.int64),
+        dtype=torch.long,
+        device=device,
+    )
+
+    rho = torch.zeros((Z, Y, X), dtype=torch.float32, device=device)
+    rho_flat = rho.view(-1)
 
     for f in faces:
-        v0, v1, v2 = vertices[f]
+        tri = vertices[f]  # (3,3)
+        v0, v1, v2 = tri[0], tri[1], tri[2]
 
-        area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
-        if area <= 0:
+        area = 0.5 * torch.linalg.norm(torch.cross(v1 - v0, v2 - v0, dim=0))
+        area_val = float(area)
+        if area_val <= 0.0:
             continue
 
-        n = max(1, int(np.ceil(area / (spacing_nm ** 2))))
-        m = int(np.ceil(np.sqrt(n)))
+        n = max(1, int(math.ceil(area_val / (spacing_nm ** 2))))
+        m = int(math.ceil(math.sqrt(n)))
 
-        for i in range(m + 1):
-            for j in range(m + 1 - i):
-                a = i / max(m, 1)
-                b = j / max(m, 1)
-                c = 1.0 - a - b
+        bary = _triangle_barycentric_grid(m, device=device)  # (N,3)
 
-                p = a * v0 + b * v1 + c * v2
+        # p = a*v0 + b*v1 + c*v2
+        pts = (
+            bary[:, 0:1] * v0.unsqueeze(0) +
+            bary[:, 1:2] * v1.unsqueeze(0) +
+            bary[:, 2:3] * v2.unsqueeze(0)
+        )  # (N,3)
 
-                ix = int(np.floor((p[0] - x0) / sx))
-                iy = int(np.floor((p[1] - y0) / sy))
-                iz = int(np.floor((p[2] - z0) / sz))
+        ix = torch.floor((pts[:, 0] - x0) / sx).long()
+        iy = torch.floor((pts[:, 1] - y0) / sy).long()
+        iz = torch.floor((pts[:, 2] - z0) / sz).long()
 
-                iy = (Y - 1) - iy
+        iy = (Y - 1) - iy
 
-                if 0 <= ix < X and 0 <= iy < Y and 0 <= iz < Z:
-                    rho[iz, iy, ix] += 1.0
+        valid = (
+            (ix >= 0) & (ix < X) &
+            (iy >= 0) & (iy < Y) &
+            (iz >= 0) & (iz < Z)
+        )
+
+        if not torch.any(valid):
+            continue
+
+        ix = ix[valid]
+        iy = iy[valid]
+        iz = iz[valid]
+
+        flat_idx = iz * (Y * X) + iy * X + ix
+        vals = torch.ones_like(flat_idx, dtype=torch.float32)
+
+        rho_flat.scatter_add_(0, flat_idx, vals)
 
     return rho
 
 
-def mesh_filled_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx):
+def mesh_filled_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, device=None):
     """
     Filled neuron labeling:
     all voxels whose centers lie inside the mesh get fluorophore density.
+    This corresponds to cytoplasmic / GFP-like filling.
 
-    Memory-safe version: process one z-slice at a time.
+    Note:
+    mesh.contains(...) is still CPU-based via trimesh.
+    Output is returned as torch tensor.
     """
+    device = get_device(device)
+
     Z, Y, X = shape_zyx
     sx, sy, sz = voxel_size_nm_xyz
     x0, y0, z0 = origin_nm
 
-    rho = np.zeros((Z, Y, X), dtype=np.float32)
-
     mesh = trimesh.load(mesh_path, process=False)
 
-    # x/y voxel-center coordinates
     xs = x0 + (np.arange(X) + 0.5) * sx
     ys = y0 + (np.arange(Y) + 0.5) * sy
+    zs = z0 + (np.arange(Z) + 0.5) * sz
 
-    XX, YY = np.meshgrid(xs, ys, indexing="xy")   # shape (Y, X)
+    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="xy")
+    pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=1)
 
-    for iz in range(Z):
-        zc = z0 + (iz + 0.5) * sz
+    inside = mesh.contains(pts)
 
-        pts = np.stack(
-            [
-                XX.ravel(),
-                YY.ravel(),
-                np.full(XX.size, zc, dtype=np.float64),
-            ],
-            axis=1,
-        )
+    rho_yxz = inside.reshape(Y, X, Z).astype(np.float32)
+    rho = np.transpose(rho_yxz, (2, 0, 1))
+    rho = rho[:, ::-1, :].copy()
 
-        inside = mesh.contains(pts).reshape(Y, X).astype(np.float32)
-
-        # flip Y to match image coordinates
-        rho[iz] = inside[::-1, :]
-
-    return rho
+    return torch.as_tensor(rho, dtype=torch.float32, device=device)
 
 
-def smooth_density_zyx(rho_zyx, sigma_zyx=(0.6, 0.8, 0.8), normalize_sum=True):
+def gaussian_kernel1d_torch(sigma, truncate=3.0, device=None, dtype=torch.float32):
+    """
+    Create normalized 1D Gaussian kernel in torch.
+    sigma is in voxel units.
+    """
+    device = get_device(device)
+
+    if sigma <= 0:
+        return torch.tensor([1.0], dtype=dtype, device=device)
+
+    radius = int(math.ceil(truncate * sigma))
+    x = torch.arange(-radius, radius + 1, dtype=dtype, device=device)
+    k = torch.exp(-(x ** 2) / (2 * sigma * sigma))
+    k = k / k.sum()
+    return k
+
+
+def smooth_density_zyx(rho_zyx, sigma_zyx=(0.6, 0.8, 0.8), normalize_sum=True, device=None):
     """
     Smooth the binned density slightly so it behaves more like a continuous field.
 
     sigma_zyx: Gaussian smoothing in voxel units (z, y, x)
     normalize_sum: preserve total mass after smoothing
     """
-    rho_zyx = rho_zyx.astype(np.float32, copy=False)
-    rho_s = gaussian_filter(rho_zyx, sigma=sigma_zyx).astype(np.float32, copy=False)
+    device = get_device(device)
+    rho_zyx = as_torch(rho_zyx, device=device, dtype=torch.float32)
+
+    s0 = rho_zyx.sum()
+
+    sz, sy, sx = sigma_zyx
+    kz = gaussian_kernel1d_torch(sz, device=device)
+    ky = gaussian_kernel1d_torch(sy, device=device)
+    kx = gaussian_kernel1d_torch(sx, device=device)
+
+    x = rho_zyx.unsqueeze(0).unsqueeze(0)  # (1,1,Z,Y,X)
+
+    wz = kz.view(1, 1, -1, 1, 1)
+    x = F.conv3d(x, wz, padding=(kz.numel() // 2, 0, 0))
+
+    wy = ky.view(1, 1, 1, -1, 1)
+    x = F.conv3d(x, wy, padding=(0, ky.numel() // 2, 0))
+
+    wx = kx.view(1, 1, 1, 1, -1)
+    x = F.conv3d(x, wx, padding=(0, 0, kx.numel() // 2))
+
+    rho_s = x[0, 0]
 
     if normalize_sum:
-        s0 = float(rho_zyx.sum())
-        s1 = float(rho_s.sum())
-        if s1 > 0:
-            rho_s *= (s0 / s1)
+        s1 = rho_s.sum()
+        if float(s1) > 0.0:
+            rho_s = rho_s * (s0 / s1)
 
     return rho_s
 
 
-def ensure_psf_odd_xy(psf_zyx, renormalize=False):
-    """Pad PSF to odd Y,X if needed (keeps center well-defined)."""
+def ensure_psf_odd_xy(psf_zyx, renormalize=False, device=None):
+    """
+    Pad PSF to odd Y,X if needed (keeps center well-defined).
+    Returns torch tensor.
+    """
+    device = get_device(device)
+    psf_zyx = as_torch(psf_zyx, device=device, dtype=torch.float32)
+
     Z, Y, X = psf_zyx.shape
     pad_y = 1 if (Y % 2 == 0) else 0
     pad_x = 1 if (X % 2 == 0) else 0
 
     if pad_y or pad_x:
-        psf_zyx = np.pad(psf_zyx, ((0, 0), (0, pad_y), (0, pad_x)), mode="constant")
+        psf_zyx = F.pad(psf_zyx, (0, pad_x, 0, pad_y, 0, 0), mode="constant", value=0.0)
 
     if renormalize:
-        s = float(psf_zyx.sum())
-        if s > 0:
+        s = psf_zyx.sum()
+        if float(s) > 0.0:
             psf_zyx = psf_zyx / s
 
     return psf_zyx

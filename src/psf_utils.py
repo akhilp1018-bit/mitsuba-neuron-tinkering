@@ -11,7 +11,7 @@ def load_psf_zyx(path: str) -> np.ndarray:
         arr = np.moveaxis(arr, int(np.argmin(arr.shape)), 0)
 
     arr /= (arr.sum() + 1e-12)
-    return arr
+    return arr.astype(np.float32)
 
 def fwhm_to_sigma(fwhm: float) -> float:
     return fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
