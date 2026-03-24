@@ -52,6 +52,11 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
 
     if mesh.faces is None or len(mesh.faces) == 0:
         raise ValueError(f"Mesh has no faces: {mesh_path}")
+    
+    print("watertight:", mesh.is_watertight)
+    print("vertices:", len(mesh.vertices))
+    print("faces:", len(mesh.faces))
+
 
     vertices_nm = mesh.vertices.astype(np.float64)
 
@@ -68,7 +73,7 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
     mesh.export(tmp_path)
     print(f"Prepared temporary centered mesh: {tmp_path}")
     return tmp_path
-
+   
 
 # -----------------------------
 # Paths
