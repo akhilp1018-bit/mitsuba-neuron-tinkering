@@ -2,10 +2,12 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
+import tempfile
 
 import numpy as np
 import torch
 import mitsuba as mi
+import trimesh
 
 from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
@@ -24,10 +26,61 @@ mi.set_variant("scalar_rgb")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+
+def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
+    """
+    Returns a mesh path that Mitsuba can load.
+
+    If use_h01_preprocess=True:
+      - load mesh with trimesh
+      - H01 vertices are assumed to be in nanometers
+      - center mesh at origin
+      - keep output in nanometers so the rest of the script stays unchanged
+      - write a temporary .ply and return that path
+
+    If use_h01_preprocess=False:
+      - return original mesh_path unchanged
+    """
+    if not use_h01_preprocess:
+        return mesh_path
+
+    print(f"Preprocessing H01 mesh: {mesh_path}")
+    mesh = trimesh.load(mesh_path, force="mesh")
+
+    if mesh.vertices is None or len(mesh.vertices) == 0:
+        raise ValueError(f"Mesh has no vertices: {mesh_path}")
+
+    if mesh.faces is None or len(mesh.faces) == 0:
+        raise ValueError(f"Mesh has no faces: {mesh_path}")
+
+    vertices_nm = mesh.vertices.astype(np.float64)
+
+    # Center mesh in nm
+    center_nm = vertices_nm.mean(axis=0, keepdims=True)
+    vertices_nm = vertices_nm - center_nm
+
+    mesh.vertices = vertices_nm
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    mesh.export(tmp_path)
+    print(f"Prepared temporary centered mesh: {tmp_path}")
+    return tmp_path
+
+
 # -----------------------------
 # Paths
 # -----------------------------
-MESH_PATH = "neuron/mesh_centered.ply"
+# Old mesh example:
+# MESH_PATH = "neuron/mesh_centered.ply"
+# USE_H01_PREPROCESS = False
+
+# H01 mesh example:
+MESH_PATH = "neuron/h01_mesh_3896803064.ply"
+USE_H01_PREPROCESS = True
+
 OUT_DIR = "scripts/zstack_out"
 PSF_EM_TIF = "scripts/psf_bornwolf_488nm_NA1_xy200nm_z500nm_65x65x13.tif"
 
@@ -62,7 +115,7 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "filled"   # "membrane" or "filled"
-SPACING_LIST_NM = [200] #[100.0, 150.0, 200.0, 300.0, 500.0]
+SPACING_LIST_NM = [200]    # for membrane mode
 BATCH_FACES = 2048
 
 # -----------------------------
@@ -96,6 +149,8 @@ INTENSITY_VAR_SIGMA_ZYX = (2.0, 4.0, 4.0)
 INTENSITY_VAR_SEED = 0
 
 print("=== SETTINGS ===")
+print(f"MESH_PATH={MESH_PATH}")
+print(f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}")
 print(f"XY_UM_PER_PX={XY_UM_PER_PX} µm/px, Z_STEP_UM={Z_STEP_UM} µm")
 print(f"ROI={USE_ROI} ({ROI_SIZE_UM_X}×{ROI_SIZE_UM_Y} µm), center={ROI_CENTER_MODE}, margin={MARGIN}")
 print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={JITTER_UM}")
@@ -111,9 +166,17 @@ print(f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}, INTENSITY_VAR_SIGMA_ZYX={INTENSIT
 print("===============")
 
 # -----------------------------
+# 0) Prepare mesh for simulation
+# -----------------------------
+SIM_MESH_PATH = prepare_mesh_for_sim(
+    MESH_PATH,
+    use_h01_preprocess=USE_H01_PREPROCESS,
+)
+
+# -----------------------------
 # 1) Load mesh bbox with Mitsuba (nm)
 # -----------------------------
-mesh = mi.load_dict({"type": "ply", "filename": MESH_PATH})
+mesh = mi.load_dict({"type": "ply", "filename": SIM_MESH_PATH})
 bbox = mesh.bbox()
 
 xmin0, ymin0, zmin = float(bbox.min[0]), float(bbox.min[1]), float(bbox.min[2])
@@ -168,7 +231,7 @@ u_in = v_in = z_in = None
 
 if MODE == "splat":
     points = sample_thickshell_emitters_nm(
-        mesh_path=MESH_PATH,
+        mesh_path=SIM_MESH_PATH,
         num_emitters=NUM_EMITTERS,
         thickness_um=THICKNESS_UM,
         jitter_um=JITTER_UM,
@@ -281,7 +344,7 @@ elif MODE == "density":
 
             t0 = time.time()
             rho = mesh_to_density_zyx(
-                mesh_path=MESH_PATH,
+                mesh_path=SIM_MESH_PATH,
                 origin_nm=origin_nm,
                 voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
                 shape_zyx=(NUM_SLICES, H, W),
@@ -390,6 +453,9 @@ elif MODE == "density":
                 f"DEVICE={device}",
                 f"MODE={MODE}",
                 f"LABELING_MODE={LABELING_MODE}",
+                f"MESH_PATH={MESH_PATH}",
+                f"SIM_MESH_PATH={SIM_MESH_PATH}",
+                f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
                 f"MESH_DENSITY_SPACING_NM={spacing_nm}",
                 f"BATCH_FACES={BATCH_FACES}",
                 f"PSF_MODE={psf_tag}",
@@ -422,7 +488,7 @@ elif MODE == "density":
 
         t0 = time.time()
         rho = mesh_filled_to_density_zyx(
-            mesh_path=MESH_PATH,
+            mesh_path=SIM_MESH_PATH,
             origin_nm=origin_nm,
             voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
             shape_zyx=(NUM_SLICES, H, W),
@@ -496,6 +562,9 @@ elif MODE == "density":
             f"DEVICE={device}",
             f"MODE={MODE}",
             f"LABELING_MODE={LABELING_MODE}",
+            f"MESH_PATH={MESH_PATH}",
+            f"SIM_MESH_PATH={SIM_MESH_PATH}",
+            f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
             f"PSF_MODE={psf_tag}",
             f"lambda_nm={LAMBDA_NM}",
             f"NA={NA}",
@@ -506,7 +575,7 @@ elif MODE == "density":
             f"THICKNESS_UM={THICKNESS_UM}",
             f"JITTER_UM={JITTER_UM}",
             f"W={W}",
-                f"H={H}",
+            f"H={H}",
             f"NUM_SLICES={NUM_SLICES}",
             f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
             f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
@@ -518,6 +587,9 @@ elif MODE == "density":
 
         meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
         print("Saved metadata:", meta_txt)
+
+    else:
+        raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
 
 else:
     raise ValueError("MODE must be 'splat' or 'density'")

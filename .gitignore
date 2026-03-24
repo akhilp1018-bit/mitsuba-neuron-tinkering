@@ -26,3 +26,6 @@ zstack_out/
 # OS
 .DS_Store
 Thumbs.db
+
+# segment ids
+segment_ids.txt
