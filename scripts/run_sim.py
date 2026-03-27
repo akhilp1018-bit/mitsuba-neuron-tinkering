@@ -118,7 +118,7 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "memberane"   # "membrane" or "pseudofilled"
+LABELING_MODE = "membrane"   # "membrane" or "pseudofilled"
 SPACING_LIST_NM = [100,200]
 BATCH_FACES = 2048
 PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
