@@ -13,6 +13,7 @@ from src.psf_utils import load_psf_zyx, make_gaussian_psf_matched_zyx
 from src.sampling import sample_thickshell_emitters_nm
 from src.splat import splat_emitters_with_psf_zyx
 from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
+from src.noise_utils import add_microscopy_noise_torch
 from src.density_utils import (
     mesh_to_density_zyx,
     mesh_pseudofilled_to_density_zyx,
@@ -117,15 +118,15 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "pseudofilled"   # "membrane" or "pseudofilled"
-SPACING_LIST_NM = [200]
+LABELING_MODE = "memberane"   # "membrane" or "pseudofilled"
+SPACING_LIST_NM = [100,200]
 BATCH_FACES = 2048
 PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
 
 # -----------------------------
 # PSF selection + optics
 # -----------------------------
-USE_GAUSSIAN_PSF = True
+USE_GAUSSIAN_PSF = False
 LAMBDA_NM = 488.0
 NA = 1.0
 REF_INDEX = 1.33
@@ -152,6 +153,14 @@ INTENSITY_VAR_STD = 0.10
 INTENSITY_VAR_SIGMA_ZYX = (2.0, 4.0, 4.0)
 INTENSITY_VAR_SEED = 0
 
+# -----------------------------
+# Noise settings
+# -----------------------------
+USE_NOISE = True
+NOISE_PEAK_PHOTONS = 500.0
+NOISE_READ_STD = 5.0
+NOISE_SEED = 0
+
 print("=== SETTINGS ===")
 print(f"MESH_PATH={MESH_PATH}")
 print(f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}")
@@ -168,6 +177,10 @@ print(f"Image formation MODE={MODE}")
 print(f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}")
 print(f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}")
 print(f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}, INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}")
+print(f"USE_NOISE={USE_NOISE}")
+print(f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}")
+print(f"NOISE_READ_STD={NOISE_READ_STD}")
+print(f"NOISE_SEED={NOISE_SEED}")
 print("===============")
 
 # -----------------------------
@@ -304,10 +317,20 @@ if MODE == "splat":
         psf_zyx=psf_eff.detach().cpu().numpy(),
     )
 
-    if isinstance(vol, torch.Tensor):
-        vol_np = vol.detach().cpu().numpy()
+    if not isinstance(vol, torch.Tensor):
+        vol = torch.as_tensor(vol, dtype=torch.float32, device=device)
     else:
-        vol_np = vol.astype(np.float32, copy=False)
+        vol = vol.to(device=device, dtype=torch.float32)
+
+    if USE_NOISE:
+        vol = add_microscopy_noise_torch(
+            vol,
+            peak_photons=NOISE_PEAK_PHOTONS,
+            read_noise_std=NOISE_READ_STD,
+            seed=NOISE_SEED,
+        )
+
+    vol_np = vol.detach().cpu().numpy()
 
     if isinstance(psf_eff, torch.Tensor):
         psf_np = psf_eff.detach().cpu().numpy()
@@ -318,6 +341,8 @@ if MODE == "splat":
     print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
 
     tag = f"EMonly_splat_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
+    if USE_NOISE:
+        tag += "_noisy"
 
     vol_f = vol_np.astype(np.float32, copy=False)
     vol_f /= (vol_f.max() + 1e-12)
@@ -334,6 +359,35 @@ if MODE == "splat":
     )
 
     print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
+
+    meta_lines = [
+        "=== Render metadata ===",
+        f"DEVICE={device}",
+        f"MODE={MODE}",
+        f"LABELING_MODE={LABELING_MODE}",
+        f"MESH_PATH={MESH_PATH}",
+        f"SIM_MESH_PATH={SIM_MESH_PATH}",
+        f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
+        f"PSF_MODE={psf_tag}",
+        f"lambda_nm={LAMBDA_NM}",
+        f"NA={NA}",
+        f"refractive_index={REF_INDEX}",
+        f"XY_UM_PER_PX={XY_UM_PER_PX}",
+        f"Z_STEP_UM={Z_STEP_UM}",
+        f"NUM_EMITTERS={NUM_EMITTERS}",
+        f"THICKNESS_UM={THICKNESS_UM}",
+        f"JITTER_UM={JITTER_UM}",
+        f"W={W}",
+        f"H={H}",
+        f"NUM_SLICES={NUM_SLICES}",
+        f"USE_NOISE={USE_NOISE}",
+        f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
+        f"NOISE_READ_STD={NOISE_READ_STD}",
+        f"NOISE_SEED={NOISE_SEED}",
+    ]
+
+    meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
+    print("Saved metadata:", meta_txt)
 
 elif MODE == "density":
     voxel_x_nm = XY_UM_PER_PX * 1000.0
@@ -426,6 +480,14 @@ elif MODE == "density":
                 torch.cuda.synchronize()
             print("focal_stack time:", time.time() - t0)
 
+            if USE_NOISE:
+                vol = add_microscopy_noise_torch(
+                    vol,
+                    peak_photons=NOISE_PEAK_PHOTONS,
+                    read_noise_std=NOISE_READ_STD,
+                    seed=NOISE_SEED,
+                )
+
             vol_np = vol.detach().cpu().numpy()
             psf_np = psf_eff.detach().cpu().numpy()
 
@@ -436,6 +498,8 @@ elif MODE == "density":
                 f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_"
                 f"{psf_tag}_{MODE}_spacing{int(spacing_nm)}nm"
             )
+            if USE_NOISE:
+                tag += "_noisy"
 
             vol_f = vol_np.astype(np.float32, copy=False)
             vol_f /= (vol_f.max() + 1e-12)
@@ -481,6 +545,10 @@ elif MODE == "density":
                 f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
                 f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
                 f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
+                f"USE_NOISE={USE_NOISE}",
+                f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
+                f"NOISE_READ_STD={NOISE_READ_STD}",
+                f"NOISE_SEED={NOISE_SEED}",
             ]
 
             meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
@@ -542,6 +610,14 @@ elif MODE == "density":
             torch.cuda.synchronize()
         print("focal_stack time:", time.time() - t0)
 
+        if USE_NOISE:
+            vol = add_microscopy_noise_torch(
+                vol,
+                peak_photons=NOISE_PEAK_PHOTONS,
+                read_noise_std=NOISE_READ_STD,
+                seed=NOISE_SEED,
+            )
+
         vol_np = vol.detach().cpu().numpy()
         psf_np = psf_eff.detach().cpu().numpy()
 
@@ -549,6 +625,8 @@ elif MODE == "density":
         print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
 
         tag = f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
+        if USE_NOISE:
+            tag += "_noisy"
 
         vol_f = vol_np.astype(np.float32, copy=False)
         vol_f /= (vol_f.max() + 1e-12)
@@ -595,6 +673,10 @@ elif MODE == "density":
             f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
             f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
             f"PSEUDOFILL_SIGMA_ZYX={PSEUDOFILL_SIGMA_ZYX}",
+            f"USE_NOISE={USE_NOISE}",
+            f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
+            f"NOISE_READ_STD={NOISE_READ_STD}",
+            f"NOISE_SEED={NOISE_SEED}",
         ]
 
         meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
