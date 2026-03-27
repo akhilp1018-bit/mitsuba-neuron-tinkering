@@ -125,7 +125,7 @@ PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
 # -----------------------------
 # PSF selection + optics
 # -----------------------------
-USE_GAUSSIAN_PSF = False
+USE_GAUSSIAN_PSF = True
 LAMBDA_NM = 488.0
 NA = 1.0
 REF_INDEX = 1.33
