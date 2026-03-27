@@ -15,7 +15,7 @@ from src.splat import splat_emitters_with_psf_zyx
 from src.io_utils import save_stack_imagej_zyx_u16, save_run_metadata_txt
 from src.density_utils import (
     mesh_to_density_zyx,
-    mesh_filled_to_density_zyx,
+    mesh_pseudofilled_to_density_zyx,
     smooth_density_zyx,
     ensure_psf_odd_xy,
     focal_stack_from_density,
@@ -52,18 +52,16 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
 
     if mesh.faces is None or len(mesh.faces) == 0:
         raise ValueError(f"Mesh has no faces: {mesh_path}")
-    
+
     print("watertight:", mesh.is_watertight)
     print("vertices:", len(mesh.vertices))
     print("faces:", len(mesh.faces))
-
 
     vertices_nm = mesh.vertices.astype(np.float64)
 
     # Center mesh in nm
     center_nm = vertices_nm.mean(axis=0, keepdims=True)
     vertices_nm = vertices_nm - center_nm
-
     mesh.vertices = vertices_nm
 
     tmp = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
@@ -73,7 +71,7 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
     mesh.export(tmp_path)
     print(f"Prepared temporary centered mesh: {tmp_path}")
     return tmp_path
-   
+
 
 # -----------------------------
 # Paths
@@ -119,9 +117,10 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "membrane"   # "membrane" or "filled"
-SPACING_LIST_NM = [200]    # for membrane mode
+LABELING_MODE = "pseudofilled"   # "membrane" or "pseudofilled"
+SPACING_LIST_NM = [200]
 BATCH_FACES = 2048
+PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
 
 # -----------------------------
 # PSF selection + optics
@@ -162,6 +161,7 @@ print(f"NUM_EMITTERS={NUM_EMITTERS:,}, THICKNESS_UM={THICKNESS_UM}, JITTER_UM={J
 print(f"LABELING_MODE={LABELING_MODE}")
 print(f"SPACING_LIST_NM={SPACING_LIST_NM}")
 print(f"BATCH_FACES={BATCH_FACES}")
+print(f"PSEUDOFILL_SIGMA_ZYX={PSEUDOFILL_SIGMA_ZYX}")
 print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}")
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
@@ -488,20 +488,24 @@ elif MODE == "density":
 
         print("All spacing experiments completed.")
 
-    elif LABELING_MODE == "filled":
+    elif LABELING_MODE == "pseudofilled":
         spacing_nm = SPACING_LIST_NM[0]
 
         t0 = time.time()
-        rho = mesh_filled_to_density_zyx(
+        rho = mesh_pseudofilled_to_density_zyx(
             mesh_path=SIM_MESH_PATH,
             origin_nm=origin_nm,
             voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
             shape_zyx=(NUM_SLICES, H, W),
+            spacing_nm=spacing_nm,
             device=device,
+            batch_faces=BATCH_FACES,
+            fill_sigma_zyx=PSEUDOFILL_SIGMA_ZYX,
+            normalize_sum=False,
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
-        print("mesh_filled_to_density time:", time.time() - t0)
+        print("mesh_pseudofilled_to_density time:", time.time() - t0)
 
         print(
             "rho_raw:",
@@ -570,6 +574,8 @@ elif MODE == "density":
             f"MESH_PATH={MESH_PATH}",
             f"SIM_MESH_PATH={SIM_MESH_PATH}",
             f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
+            f"MESH_DENSITY_SPACING_NM={spacing_nm}",
+            f"BATCH_FACES={BATCH_FACES}",
             f"PSF_MODE={psf_tag}",
             f"lambda_nm={LAMBDA_NM}",
             f"NA={NA}",
@@ -588,13 +594,14 @@ elif MODE == "density":
             f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
             f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
             f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
+            f"PSEUDOFILL_SIGMA_ZYX={PSEUDOFILL_SIGMA_ZYX}",
         ]
 
         meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
         print("Saved metadata:", meta_txt)
 
     else:
-        raise ValueError("LABELING_MODE must be 'membrane' or 'filled'")
+        raise ValueError("LABELING_MODE must be 'membrane' or 'pseudofilled'")
 
 else:
     raise ValueError("MODE must be 'splat' or 'density'")

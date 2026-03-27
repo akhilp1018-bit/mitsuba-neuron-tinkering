@@ -139,7 +139,7 @@ def mesh_to_density_zyx(
         for start in range(0, tris_m.shape[0], batch_faces):
             tri_batch = tris_m[start:start + batch_faces]  # (B,3,3)
 
-            vb0 = tri_batch[:, 0, :]  # (B,3)
+            vb0 = tri_batch[:, 0, :]
             vb1 = tri_batch[:, 1, :]
             vb2 = tri_batch[:, 2, :]
 
@@ -149,7 +149,7 @@ def mesh_to_density_zyx(
                 bary[None, :, 2:3] * vb2[:, None, :]
             )  # (B,P,3)
 
-            pts = pts.reshape(-1, 3)  # (B*P,3)
+            pts = pts.reshape(-1, 3)
 
             ix = torch.floor((pts[:, 0] - x0) / sx).long()
             iy = torch.floor((pts[:, 1] - y0) / sy).long()
@@ -178,38 +178,47 @@ def mesh_to_density_zyx(
     return rho
 
 
-def mesh_filled_to_density_zyx(mesh_path, origin_nm, voxel_size_nm_xyz, shape_zyx, device=None):
+def mesh_pseudofilled_to_density_zyx(
+    mesh_path,
+    origin_nm,
+    voxel_size_nm_xyz,
+    shape_zyx,
+    spacing_nm=200.0,
+    device=None,
+    batch_faces=2048,
+    fill_sigma_zyx=(2.0, 2.5, 2.5),
+    normalize_sum=False,
+):
     """
-    Filled neuron labeling:
-    all voxels whose centers lie inside the mesh get fluorophore density.
-    This corresponds to cytoplasmic / GFP-like filling.
+    GPU-friendly pseudo-filled density for non-watertight meshes.
 
-    Note:
-    mesh.contains(...) is still CPU-based via trimesh.
-    Output is returned as torch tensor.
+    Strategy:
+    1) Create membrane/surface density from mesh sampling
+    2) Spread this density into the volume using stronger 3D smoothing
+
+    This is not a true geometric inside-fill.
+    It is an approximation of cytoplasmic labeling for open meshes.
     """
     device = get_device(device)
 
-    Z, Y, X = shape_zyx
-    sx, sy, sz = voxel_size_nm_xyz
-    x0, y0, z0 = origin_nm
+    rho = mesh_to_density_zyx(
+        mesh_path=mesh_path,
+        origin_nm=origin_nm,
+        voxel_size_nm_xyz=voxel_size_nm_xyz,
+        shape_zyx=shape_zyx,
+        spacing_nm=spacing_nm,
+        device=device,
+        batch_faces=batch_faces,
+    )
 
-    mesh = trimesh.load(mesh_path, process=False)
+    rho_fill = smooth_density_zyx(
+        rho,
+        sigma_zyx=fill_sigma_zyx,
+        normalize_sum=normalize_sum,
+        device=device,
+    )
 
-    xs = x0 + (np.arange(X) + 0.5) * sx
-    ys = y0 + (np.arange(Y) + 0.5) * sy
-    zs = z0 + (np.arange(Z) + 0.5) * sz
-
-    XX, YY, ZZ = np.meshgrid(xs, ys, zs, indexing="xy")
-    pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=1)
-
-    inside = mesh.contains(pts)
-
-    rho_yxz = inside.reshape(Y, X, Z).astype(np.float32)
-    rho = np.transpose(rho_yxz, (2, 0, 1))
-    rho = rho[:, ::-1, :].copy()
-
-    return torch.as_tensor(rho, dtype=torch.float32, device=device)
+    return rho_fill
 
 
 def gaussian_kernel1d_torch(sigma, truncate=3.0, device=None, dtype=torch.float32):
