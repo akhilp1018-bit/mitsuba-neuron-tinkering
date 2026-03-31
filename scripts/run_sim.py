@@ -60,7 +60,6 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
 
     vertices_nm = mesh.vertices.astype(np.float64)
 
-    # Center mesh in nm
     center_nm = vertices_nm.mean(axis=0, keepdims=True)
     vertices_nm = vertices_nm - center_nm
     mesh.vertices = vertices_nm
@@ -74,14 +73,23 @@ def prepare_mesh_for_sim(mesh_path, use_h01_preprocess=False):
     return tmp_path
 
 
+def make_noise_levels(num_steps, peak_max, peak_min):
+    """
+    Return photon-count levels from cleaner -> noisier.
+    Higher peak_photons = cleaner
+    Lower peak_photons = stronger shot noise
+    """
+    if num_steps < 2:
+        return [float(peak_min)]
+    return np.linspace(float(peak_max), float(peak_min), int(num_steps)).tolist()
+
+
 # -----------------------------
 # Paths
 # -----------------------------
-# Old mesh example:
 # MESH_PATH = "neuron/mesh_centered.ply"
 # USE_H01_PREPROCESS = False
 
-# H01 mesh example:
 MESH_PATH = "neuron/h01_mesh_3896803064.ply"
 USE_H01_PREPROCESS = True
 
@@ -93,8 +101,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # -----------------------------
 # Physical sampling
 # -----------------------------
-XY_UM_PER_PX = 0.2   # 200 nm/px
-Z_STEP_UM = 0.5      # 500 nm/slice
+XY_UM_PER_PX = 0.2
+Z_STEP_UM = 0.5
 Z_STEP_NM = Z_STEP_UM * 1000.0
 
 # -----------------------------
@@ -108,7 +116,6 @@ MARGIN = 0.05
 
 # -----------------------------
 # Thick-shell emitters
-# (used only for splat mode)
 # -----------------------------
 NUM_EMITTERS = 4_000_000
 THICKNESS_UM = 2.0
@@ -119,7 +126,7 @@ RNG_SEED = 0
 # Labeling / density settings
 # -----------------------------
 LABELING_MODE = "membrane"   # "membrane" or "pseudofilled"
-SPACING_LIST_NM = [100,200]
+SPACING_LIST_NM = [100]
 BATCH_FACES = 2048
 PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
 
@@ -135,9 +142,7 @@ GAUSS_PSF_SHAPE_ZYX = (13, 65, 65)
 # -----------------------------
 # Choose image formation mode
 # -----------------------------
-# "splat": original emitter splatting
-# "density": density field + 3D PSF rendering
-MODE = "density"
+MODE = "density"   # "splat" or "density"
 
 # -----------------------------
 # Density regularization
@@ -157,8 +162,11 @@ INTENSITY_VAR_SEED = 0
 # Noise settings
 # -----------------------------
 USE_NOISE = True
-NOISE_PEAK_PHOTONS = 500.0
-NOISE_READ_STD = 5.0
+NOISE_SWEEP = True
+NOISE_NUM_STEPS = 20
+NOISE_PEAK_PHOTONS_MAX = 2000.0   # cleaner
+NOISE_PEAK_PHOTONS_MIN = 50.0     # noisier
+NOISE_READ_STD = 1.0
 NOISE_SEED = 0
 
 print("=== SETTINGS ===")
@@ -175,10 +183,14 @@ print(f"PSF mode: {'GAUSSIAN' if USE_GAUSSIAN_PSF else 'BORN&WOLF (Fiji TIFF)'}"
 print(f"Optics: lambda={LAMBDA_NM} nm, NA={NA}, n={REF_INDEX}")
 print(f"Image formation MODE={MODE}")
 print(f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}")
+print(f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}")
 print(f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}")
 print(f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}, INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}")
 print(f"USE_NOISE={USE_NOISE}")
-print(f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}")
+print(f"NOISE_SWEEP={NOISE_SWEEP}")
+print(f"NOISE_NUM_STEPS={NOISE_NUM_STEPS}")
+print(f"NOISE_PEAK_PHOTONS_MAX={NOISE_PEAK_PHOTONS_MAX}")
+print(f"NOISE_PEAK_PHOTONS_MIN={NOISE_PEAK_PHOTONS_MIN}")
 print(f"NOISE_READ_STD={NOISE_READ_STD}")
 print(f"NOISE_SEED={NOISE_SEED}")
 print("===============")
@@ -211,7 +223,6 @@ xmax_m = xmax0 + MARGIN * xrange_nm
 ymin_m = ymin0 - MARGIN * yrange_nm
 ymax_m = ymax0 + MARGIN * yrange_nm
 
-# Define ROI bbox
 if USE_ROI:
     if ROI_CENTER_MODE != "bbox_center":
         raise ValueError("ROI_CENTER_MODE not recognized. Use 'bbox_center'.")
@@ -301,6 +312,97 @@ NUM_SLICES = int(np.ceil(depth_nm_total / Z_STEP_NM)) + 1
 
 print(f"Neuron depth: {depth_nm_total / 1000.0:.2f} µm -> NUM_SLICES={NUM_SLICES}")
 
+
+def save_volume_and_metadata(
+    vol_base,
+    base_tag,
+    extra_meta_lines,
+):
+    """
+    Save either a single clean/noisy volume or a whole noise sweep.
+    vol_base must be a torch tensor on device.
+    """
+    if USE_NOISE and NOISE_SWEEP:
+        noise_levels = make_noise_levels(
+            NOISE_NUM_STEPS,
+            NOISE_PEAK_PHOTONS_MAX,
+            NOISE_PEAK_PHOTONS_MIN,
+        )
+    elif USE_NOISE:
+        noise_levels = [NOISE_PEAK_PHOTONS_MAX]
+    else:
+        noise_levels = [None]
+
+    for i, peak_photons in enumerate(noise_levels):
+        vol_curr = vol_base.clone()
+
+        if peak_photons is not None:
+            vol_curr = add_microscopy_noise_torch(
+                vol_curr,
+                peak_photons=peak_photons,
+                read_noise_std=NOISE_READ_STD,
+                seed=NOISE_SEED + i,
+            )
+
+        vol_np = vol_curr.detach().cpu().numpy()
+
+        print(
+            f"vol step {i + 1}/{len(noise_levels)}:",
+            vol_np.shape,
+            "min/max=",
+            float(vol_np.min()),
+            float(vol_np.max()),
+        )
+
+        if peak_photons is None:
+            tag = base_tag
+        else:
+            tag = f"{base_tag}_photons{int(round(peak_photons))}_read{NOISE_READ_STD:.1f}"
+
+        vol_f = vol_np.astype(np.float32, copy=False)
+        vol_f /= (vol_f.max() + 1e-12)
+        np.clip(vol_f, 0.0, 1.0, out=vol_f)
+        vol_f *= 65535.0
+        stack_u16 = vol_f.astype(np.uint16)
+
+        tiff_path = save_stack_imagej_zyx_u16(
+            out_dir=OUT_DIR,
+            tag=tag,
+            stack_u16_zyx=stack_u16,
+            xy_um_per_px=XY_UM_PER_PX,
+            z_step_um=Z_STEP_UM,
+        )
+        print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
+
+        meta_lines = [
+            "=== Render metadata ===",
+            f"DEVICE={device}",
+            f"MODE={MODE}",
+            f"LABELING_MODE={LABELING_MODE}",
+            f"MESH_PATH={MESH_PATH}",
+            f"SIM_MESH_PATH={SIM_MESH_PATH}",
+            f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
+            f"PSF_MODE={psf_tag}",
+            f"lambda_nm={LAMBDA_NM}",
+            f"NA={NA}",
+            f"refractive_index={REF_INDEX}",
+            f"XY_UM_PER_PX={XY_UM_PER_PX}",
+            f"Z_STEP_UM={Z_STEP_UM}",
+            f"W={W}",
+            f"H={H}",
+            f"NUM_SLICES={NUM_SLICES}",
+            f"USE_NOISE={USE_NOISE}",
+            f"NOISE_SWEEP={NOISE_SWEEP}",
+            f"NOISE_STEP_INDEX={i}",
+            f"NOISE_PEAK_PHOTONS={peak_photons}",
+            f"NOISE_READ_STD={NOISE_READ_STD}",
+            f"NOISE_SEED={NOISE_SEED + i}",
+        ] + extra_meta_lines
+
+        meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
+        print("Saved metadata:", meta_txt)
+
+
 # -----------------------------
 # 5) Image formation -> volume (Z,Y,X)
 # -----------------------------
@@ -322,72 +424,27 @@ if MODE == "splat":
     else:
         vol = vol.to(device=device, dtype=torch.float32)
 
-    if USE_NOISE:
-        vol = add_microscopy_noise_torch(
-            vol,
-            peak_photons=NOISE_PEAK_PHOTONS,
-            read_noise_std=NOISE_READ_STD,
-            seed=NOISE_SEED,
-        )
-
-    vol_np = vol.detach().cpu().numpy()
-
     if isinstance(psf_eff, torch.Tensor):
         psf_np = psf_eff.detach().cpu().numpy()
     else:
         psf_np = psf_eff
 
     print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
-    print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
+    print("clean vol:", tuple(vol.shape), "min/max=", float(vol.min().item()), float(vol.max().item()))
 
-    tag = f"EMonly_splat_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
-    if USE_NOISE:
-        tag += "_noisy"
+    base_tag = f"EMonly_splat_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
 
-    vol_f = vol_np.astype(np.float32, copy=False)
-    vol_f /= (vol_f.max() + 1e-12)
-    np.clip(vol_f, 0.0, 1.0, out=vol_f)
-    vol_f *= 65535.0
-    stack_u16 = vol_f.astype(np.uint16)
-
-    tiff_path = save_stack_imagej_zyx_u16(
-        out_dir=OUT_DIR,
-        tag=tag,
-        stack_u16_zyx=stack_u16,
-        xy_um_per_px=XY_UM_PER_PX,
-        z_step_um=Z_STEP_UM,
-    )
-
-    print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
-
-    meta_lines = [
-        "=== Render metadata ===",
-        f"DEVICE={device}",
-        f"MODE={MODE}",
-        f"LABELING_MODE={LABELING_MODE}",
-        f"MESH_PATH={MESH_PATH}",
-        f"SIM_MESH_PATH={SIM_MESH_PATH}",
-        f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
-        f"PSF_MODE={psf_tag}",
-        f"lambda_nm={LAMBDA_NM}",
-        f"NA={NA}",
-        f"refractive_index={REF_INDEX}",
-        f"XY_UM_PER_PX={XY_UM_PER_PX}",
-        f"Z_STEP_UM={Z_STEP_UM}",
+    extra_meta_lines = [
         f"NUM_EMITTERS={NUM_EMITTERS}",
         f"THICKNESS_UM={THICKNESS_UM}",
         f"JITTER_UM={JITTER_UM}",
-        f"W={W}",
-        f"H={H}",
-        f"NUM_SLICES={NUM_SLICES}",
-        f"USE_NOISE={USE_NOISE}",
-        f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
-        f"NOISE_READ_STD={NOISE_READ_STD}",
-        f"NOISE_SEED={NOISE_SEED}",
     ]
 
-    meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
-    print("Saved metadata:", meta_txt)
+    save_volume_and_metadata(
+        vol_base=vol,
+        base_tag=base_tag,
+        extra_meta_lines=extra_meta_lines,
+    )
 
 elif MODE == "density":
     voxel_x_nm = XY_UM_PER_PX * 1000.0
@@ -480,207 +537,155 @@ elif MODE == "density":
                 torch.cuda.synchronize()
             print("focal_stack time:", time.time() - t0)
 
-            if USE_NOISE:
-                vol = add_microscopy_noise_torch(
-                    vol,
-                    peak_photons=NOISE_PEAK_PHOTONS,
-                    read_noise_std=NOISE_READ_STD,
-                    seed=NOISE_SEED,
-                )
-
-            vol_np = vol.detach().cpu().numpy()
             psf_np = psf_eff.detach().cpu().numpy()
-
             print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
-            print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
+            print("clean vol:", tuple(vol.shape), "min/max=", float(vol.min().item()), float(vol.max().item()))
 
-            tag = (
+            base_tag = (
                 f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_"
                 f"{psf_tag}_{MODE}_spacing{int(spacing_nm)}nm"
             )
-            if USE_NOISE:
-                tag += "_noisy"
 
-            vol_f = vol_np.astype(np.float32, copy=False)
-            vol_f /= (vol_f.max() + 1e-12)
-            np.clip(vol_f, 0.0, 1.0, out=vol_f)
-            vol_f *= 65535.0
-            stack_u16 = vol_f.astype(np.uint16)
-
-            tiff_path = save_stack_imagej_zyx_u16(
-                out_dir=OUT_DIR,
-                tag=tag,
-                stack_u16_zyx=stack_u16,
-                xy_um_per_px=XY_UM_PER_PX,
-                z_step_um=Z_STEP_UM,
-            )
-
-            print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
-
-            meta_lines = [
-                "=== Render metadata ===",
-                f"DEVICE={device}",
-                f"MODE={MODE}",
-                f"LABELING_MODE={LABELING_MODE}",
-                f"MESH_PATH={MESH_PATH}",
-                f"SIM_MESH_PATH={SIM_MESH_PATH}",
-                f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
+            extra_meta_lines = [
                 f"MESH_DENSITY_SPACING_NM={spacing_nm}",
                 f"BATCH_FACES={BATCH_FACES}",
-                f"PSF_MODE={psf_tag}",
-                f"lambda_nm={LAMBDA_NM}",
-                f"NA={NA}",
-                f"refractive_index={REF_INDEX}",
-                f"XY_UM_PER_PX={XY_UM_PER_PX}",
-                f"Z_STEP_UM={Z_STEP_UM}",
-                f"NUM_EMITTERS={NUM_EMITTERS}",
-                f"THICKNESS_UM={THICKNESS_UM}",
-                f"JITTER_UM={JITTER_UM}",
-                f"W={W}",
-                f"H={H}",
-                f"NUM_SLICES={NUM_SLICES}",
                 f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
                 f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
                 f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}",
                 f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
                 f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
                 f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
-                f"USE_NOISE={USE_NOISE}",
-                f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
-                f"NOISE_READ_STD={NOISE_READ_STD}",
-                f"NOISE_SEED={NOISE_SEED}",
+                f"NUM_EMITTERS={NUM_EMITTERS}",
+                f"THICKNESS_UM={THICKNESS_UM}",
+                f"JITTER_UM={JITTER_UM}",
             ]
 
-            meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
-            print("Saved metadata:", meta_txt)
+            save_volume_and_metadata(
+                vol_base=vol,
+                base_tag=base_tag,
+                extra_meta_lines=extra_meta_lines,
+            )
 
         print("All spacing experiments completed.")
 
     elif LABELING_MODE == "pseudofilled":
-        spacing_nm = SPACING_LIST_NM[0]
+        for spacing_nm in SPACING_LIST_NM:
+            print("\n" + "=" * 60)
+            print(f"Running pseudofilled spacing experiment: spacing_nm = {spacing_nm}")
+            print("=" * 60)
 
-        t0 = time.time()
-        rho = mesh_pseudofilled_to_density_zyx(
-            mesh_path=SIM_MESH_PATH,
-            origin_nm=origin_nm,
-            voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
-            shape_zyx=(NUM_SLICES, H, W),
-            spacing_nm=spacing_nm,
-            device=device,
-            batch_faces=BATCH_FACES,
-            fill_sigma_zyx=PSEUDOFILL_SIGMA_ZYX,
-            normalize_sum=False,
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        print("mesh_pseudofilled_to_density time:", time.time() - t0)
+            t0 = time.time()
+            rho = mesh_pseudofilled_to_density_zyx(
+                mesh_path=SIM_MESH_PATH,
+                origin_nm=origin_nm,
+                voxel_size_nm_xyz=(voxel_x_nm, voxel_y_nm, voxel_z_nm),
+                shape_zyx=(NUM_SLICES, H, W),
+                spacing_nm=spacing_nm,
+                device=device,
+                batch_faces=BATCH_FACES,
+                fill_sigma_zyx=PSEUDOFILL_SIGMA_ZYX,
+                normalize_sum=False,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print("mesh_pseudofilled_to_density time:", time.time() - t0)
 
-        print(
-            "rho_raw:",
-            tuple(rho.shape),
-            "sum=",
-            float(rho.sum().item()),
-            "max=",
-            float(rho.max().item()),
-        )
-
-        t0 = time.time()
-        rho = smooth_density_zyx(
-            rho,
-            sigma_zyx=DENSITY_SMOOTH_SIGMA_ZYX,
-            normalize_sum=DENSITY_NORMALIZE_SUM,
-            device=device,
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        print("smooth_density time:", time.time() - t0)
-
-        print(
-            "rho_smooth:",
-            tuple(rho.shape),
-            "sum=",
-            float(rho.sum().item()),
-            "max=",
-            float(rho.max().item()),
-        )
-
-        t0 = time.time()
-        vol = focal_stack_from_density(rho, psf_eff, device=device)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        print("focal_stack time:", time.time() - t0)
-
-        if USE_NOISE:
-            vol = add_microscopy_noise_torch(
-                vol,
-                peak_photons=NOISE_PEAK_PHOTONS,
-                read_noise_std=NOISE_READ_STD,
-                seed=NOISE_SEED,
+            print(
+                "rho_raw:",
+                tuple(rho.shape),
+                "sum=",
+                float(rho.sum().item()),
+                "max=",
+                float(rho.max().item()),
             )
 
-        vol_np = vol.detach().cpu().numpy()
-        psf_np = psf_eff.detach().cpu().numpy()
+            t0 = time.time()
+            rho = smooth_density_zyx(
+                rho,
+                sigma_zyx=DENSITY_SMOOTH_SIGMA_ZYX,
+                normalize_sum=DENSITY_NORMALIZE_SUM,
+                device=device,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print("smooth_density time:", time.time() - t0)
 
-        print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
-        print("vol:", vol_np.shape, "min/max=", float(vol_np.min()), float(vol_np.max()))
+            print(
+                "rho_smooth:",
+                tuple(rho.shape),
+                "sum=",
+                float(rho.sum().item()),
+                "max=",
+                float(rho.max().item()),
+            )
 
-        tag = f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_{psf_tag}_{MODE}"
-        if USE_NOISE:
-            tag += "_noisy"
+            if USE_INTENSITY_VARIATION:
+                torch.manual_seed(INTENSITY_VAR_SEED)
 
-        vol_f = vol_np.astype(np.float32, copy=False)
-        vol_f /= (vol_f.max() + 1e-12)
-        np.clip(vol_f, 0.0, 1.0, out=vol_f)
-        vol_f *= 65535.0
-        stack_u16 = vol_f.astype(np.uint16)
+                weights = 1.0 + INTENSITY_VAR_STD * torch.randn(
+                    rho.shape, dtype=torch.float32, device=device
+                )
 
-        tiff_path = save_stack_imagej_zyx_u16(
-            out_dir=OUT_DIR,
-            tag=tag,
-            stack_u16_zyx=stack_u16,
-            xy_um_per_px=XY_UM_PER_PX,
-            z_step_um=Z_STEP_UM,
-        )
+                t0 = time.time()
+                weights = smooth_density_zyx(
+                    weights,
+                    sigma_zyx=INTENSITY_VAR_SIGMA_ZYX,
+                    normalize_sum=False,
+                    device=device,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                print("intensity_variation_smooth time:", time.time() - t0)
 
-        print("Saved stack:", tiff_path, "shape:", stack_u16.shape)
+                weights = torch.clamp(weights, min=0.0)
+                rho = rho * weights
 
-        meta_lines = [
-            "=== Render metadata ===",
-            f"DEVICE={device}",
-            f"MODE={MODE}",
-            f"LABELING_MODE={LABELING_MODE}",
-            f"MESH_PATH={MESH_PATH}",
-            f"SIM_MESH_PATH={SIM_MESH_PATH}",
-            f"USE_H01_PREPROCESS={USE_H01_PREPROCESS}",
-            f"MESH_DENSITY_SPACING_NM={spacing_nm}",
-            f"BATCH_FACES={BATCH_FACES}",
-            f"PSF_MODE={psf_tag}",
-            f"lambda_nm={LAMBDA_NM}",
-            f"NA={NA}",
-            f"refractive_index={REF_INDEX}",
-            f"XY_UM_PER_PX={XY_UM_PER_PX}",
-            f"Z_STEP_UM={Z_STEP_UM}",
-            f"NUM_EMITTERS={NUM_EMITTERS}",
-            f"THICKNESS_UM={THICKNESS_UM}",
-            f"JITTER_UM={JITTER_UM}",
-            f"W={W}",
-            f"H={H}",
-            f"NUM_SLICES={NUM_SLICES}",
-            f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
-            f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
-            f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}",
-            f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
-            f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
-            f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
-            f"PSEUDOFILL_SIGMA_ZYX={PSEUDOFILL_SIGMA_ZYX}",
-            f"USE_NOISE={USE_NOISE}",
-            f"NOISE_PEAK_PHOTONS={NOISE_PEAK_PHOTONS}",
-            f"NOISE_READ_STD={NOISE_READ_STD}",
-            f"NOISE_SEED={NOISE_SEED}",
-        ]
+                print(
+                    "rho_varied:",
+                    tuple(rho.shape),
+                    "sum=",
+                    float(rho.sum().item()),
+                    "max=",
+                    float(rho.max().item()),
+                )
 
-        meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
-        print("Saved metadata:", meta_txt)
+            t0 = time.time()
+            vol = focal_stack_from_density(rho, psf_eff, device=device)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print("focal_stack time:", time.time() - t0)
+
+            psf_np = psf_eff.detach().cpu().numpy()
+            print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
+            print("clean vol:", tuple(vol.shape), "min/max=", float(vol.min().item()), float(vol.max().item()))
+
+            base_tag = (
+                f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_"
+                f"{psf_tag}_{MODE}_spacing{int(spacing_nm)}nm"
+            )
+
+            extra_meta_lines = [
+                f"MESH_DENSITY_SPACING_NM={spacing_nm}",
+                f"BATCH_FACES={BATCH_FACES}",
+                f"DENSITY_SMOOTH_SIGMA_ZYX={DENSITY_SMOOTH_SIGMA_ZYX}",
+                f"DENSITY_NORMALIZE_SUM={DENSITY_NORMALIZE_SUM}",
+                f"USE_INTENSITY_VARIATION={USE_INTENSITY_VARIATION}",
+                f"INTENSITY_VAR_STD={INTENSITY_VAR_STD}",
+                f"INTENSITY_VAR_SIGMA_ZYX={INTENSITY_VAR_SIGMA_ZYX}",
+                f"INTENSITY_VAR_SEED={INTENSITY_VAR_SEED}",
+                f"PSEUDOFILL_SIGMA_ZYX={PSEUDOFILL_SIGMA_ZYX}",
+                f"NUM_EMITTERS={NUM_EMITTERS}",
+                f"THICKNESS_UM={THICKNESS_UM}",
+                f"JITTER_UM={JITTER_UM}",
+            ]
+
+            save_volume_and_metadata(
+                vol_base=vol,
+                base_tag=base_tag,
+                extra_meta_lines=extra_meta_lines,
+            )
+
+        print("All pseudofilled spacing experiments completed.")
 
     else:
         raise ValueError("LABELING_MODE must be 'membrane' or 'pseudofilled'")

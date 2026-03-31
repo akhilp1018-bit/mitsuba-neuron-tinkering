@@ -21,7 +21,6 @@ def add_microscopy_noise_torch(
     seed : int
         RNG seed
     """
-
     if seed is not None:
         torch.manual_seed(seed)
 
