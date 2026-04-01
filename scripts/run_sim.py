@@ -168,6 +168,7 @@ NOISE_PEAK_PHOTONS_MAX = 2000.0   # cleaner
 NOISE_PEAK_PHOTONS_MIN = 50.0     # noisier
 NOISE_READ_STD = 1.0
 NOISE_SEED = 0
+NOISE_GAUSSIAN_CHUNK_SLICES = 8
 
 print("=== SETTINGS ===")
 print(f"MESH_PATH={MESH_PATH}")
@@ -193,6 +194,7 @@ print(f"NOISE_PEAK_PHOTONS_MAX={NOISE_PEAK_PHOTONS_MAX}")
 print(f"NOISE_PEAK_PHOTONS_MIN={NOISE_PEAK_PHOTONS_MIN}")
 print(f"NOISE_READ_STD={NOISE_READ_STD}")
 print(f"NOISE_SEED={NOISE_SEED}")
+print(f"NOISE_GAUSSIAN_CHUNK_SLICES={NOISE_GAUSSIAN_CHUNK_SLICES}")
 print("===============")
 
 # -----------------------------
@@ -342,6 +344,7 @@ def save_volume_and_metadata(
                 peak_photons=peak_photons,
                 read_noise_std=NOISE_READ_STD,
                 seed=NOISE_SEED + i,
+                gaussian_chunk_slices=NOISE_GAUSSIAN_CHUNK_SLICES,
             )
 
         vol_np = vol_curr.detach().cpu().numpy()
@@ -397,10 +400,15 @@ def save_volume_and_metadata(
             f"NOISE_PEAK_PHOTONS={peak_photons}",
             f"NOISE_READ_STD={NOISE_READ_STD}",
             f"NOISE_SEED={NOISE_SEED + i}",
+            f"NOISE_GAUSSIAN_CHUNK_SLICES={NOISE_GAUSSIAN_CHUNK_SLICES}",
         ] + extra_meta_lines
 
         meta_txt = save_run_metadata_txt(OUT_DIR, tag, meta_lines)
         print("Saved metadata:", meta_txt)
+
+        del vol_curr
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 # -----------------------------
@@ -541,6 +549,10 @@ elif MODE == "density":
             print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
             print("clean vol:", tuple(vol.shape), "min/max=", float(vol.min().item()), float(vol.max().item()))
 
+            del rho
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             base_tag = (
                 f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_"
                 f"{psf_tag}_{MODE}_spacing{int(spacing_nm)}nm"
@@ -565,6 +577,10 @@ elif MODE == "density":
                 base_tag=base_tag,
                 extra_meta_lines=extra_meta_lines,
             )
+
+            del vol
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         print("All spacing experiments completed.")
 
@@ -659,6 +675,10 @@ elif MODE == "density":
             print("psf:", psf_np.shape, "sum=", float(psf_np.sum()))
             print("clean vol:", tuple(vol.shape), "min/max=", float(vol.min().item()), float(vol.max().item()))
 
+            del rho
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             base_tag = (
                 f"EMonly_{LABELING_MODE}_ROI{int(ROI_SIZE_UM_X)}x{int(ROI_SIZE_UM_Y)}um_"
                 f"{psf_tag}_{MODE}_spacing{int(spacing_nm)}nm"
@@ -684,6 +704,10 @@ elif MODE == "density":
                 base_tag=base_tag,
                 extra_meta_lines=extra_meta_lines,
             )
+
+            del vol
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         print("All pseudofilled spacing experiments completed.")
 
