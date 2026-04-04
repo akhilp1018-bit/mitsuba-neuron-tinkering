@@ -90,7 +90,7 @@ def make_noise_levels(num_steps, peak_max, peak_min):
 # MESH_PATH = "neuron/mesh_centered.ply"
 # USE_H01_PREPROCESS = False
 
-MESH_PATH = "neuron/h01_mesh_31583512415.ply"
+MESH_PATH = "neuron/h01_mesh_3896803064.ply"
 USE_H01_PREPROCESS = True
 
 OUT_DIR = "scripts/zstack_out"
@@ -108,7 +108,7 @@ Z_STEP_NM = Z_STEP_UM * 1000.0
 # -----------------------------
 # ROI settings
 # -----------------------------
-USE_ROI = False
+USE_ROI = True
 ROI_SIZE_UM_X = 200.0
 ROI_SIZE_UM_Y = 200.0
 ROI_CENTER_MODE = "bbox_center"
@@ -125,7 +125,7 @@ RNG_SEED = 0
 # -----------------------------
 # Labeling / density settings
 # -----------------------------
-LABELING_MODE = "membrane"   # "membrane" or "pseudofilled"
+LABELING_MODE = "pseudofilled"   # "membrane" or "pseudofilled"
 SPACING_LIST_NM = [100]
 BATCH_FACES = 2048
 PSEUDOFILL_SIGMA_ZYX = (2.0, 2.5, 2.5)
