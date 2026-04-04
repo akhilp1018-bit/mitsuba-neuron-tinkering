@@ -161,8 +161,8 @@ INTENSITY_VAR_SEED = 0
 # -----------------------------
 # Noise settings
 # -----------------------------
-USE_NOISE = True
-NOISE_SWEEP = True
+USE_NOISE = False
+NOISE_SWEEP = False
 NOISE_NUM_STEPS = 20
 NOISE_PEAK_PHOTONS_MAX = 2000.0   # cleaner
 NOISE_PEAK_PHOTONS_MIN = 50.0     # noisier
