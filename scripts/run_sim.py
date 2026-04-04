@@ -90,7 +90,7 @@ def make_noise_levels(num_steps, peak_max, peak_min):
 # MESH_PATH = "neuron/mesh_centered.ply"
 # USE_H01_PREPROCESS = False
 
-MESH_PATH = "neuron/h01_mesh_3896803064.ply"
+MESH_PATH = "neuron/h01_mesh_5393873129.ply"
 USE_H01_PREPROCESS = True
 
 OUT_DIR = "scripts/zstack_out"
@@ -162,7 +162,7 @@ INTENSITY_VAR_SEED = 0
 # Noise settings
 # -----------------------------
 USE_NOISE = True
-NOISE_SWEEP = True
+NOISE_SWEEP = False
 NOISE_NUM_STEPS = 20
 NOISE_PEAK_PHOTONS_MAX = 2000.0   # cleaner
 NOISE_PEAK_PHOTONS_MIN = 50.0     # noisier
