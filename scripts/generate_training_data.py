@@ -14,8 +14,8 @@ This version creates masks the same way as the run pipeline:
   1. Build density from labelled meshes
   2. Render dendrite and spines separately using PSF convolution
   3. Threshold each rendered component at relative threshold:
-       spine_mask    = vol_spines   > 0.2 * max(vol_spines)
-       dendrite_mask = vol_dendrite > 0.2 * max(vol_dendrite)
+       spine_mask    = vol_spines   > 0.1 * max(vol_spines)
+       dendrite_mask = vol_dendrite > 0.1 * max(vol_dendrite)
 
 So the training masks are image-domain masks, matching the previous run-pipeline logic.
 
@@ -116,8 +116,8 @@ INTENSITY_VAR_SIGMA_ZYX = (2.0, 4.0, 4.0)
 # ----------------------------------------------------------
 # Mask settings: same idea as run pipeline
 # ----------------------------------------------------------
-SPINE_MASK_REL_THRESHOLD = 0.2
-DENDRITE_MASK_REL_THRESHOLD = 0.2
+SPINE_MASK_REL_THRESHOLD = 0.1
+DENDRITE_MASK_REL_THRESHOLD = 0.1
 
 # ----------------------------------------------------------
 # Optional simple image noise

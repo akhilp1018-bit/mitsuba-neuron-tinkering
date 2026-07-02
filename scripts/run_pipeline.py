@@ -177,8 +177,8 @@ NOISE_GAUSSIAN_CHUNK_SLICES = 8
 # ----------------------------------------------------------
 # Mask thresholds
 # ----------------------------------------------------------
-SPINE_MASK_REL_THRESHOLD    = 0.2
-DENDRITE_MASK_REL_THRESHOLD = 0.2
+SPINE_MASK_REL_THRESHOLD    = 0.1
+DENDRITE_MASK_REL_THRESHOLD = 0.1
 
 
 # ----------------------------------------------------------
